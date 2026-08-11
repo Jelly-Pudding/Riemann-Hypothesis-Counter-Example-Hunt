@@ -1,10 +1,9 @@
 # built binaries
+riemann
 riemann.exe
 riemann-linux-amd64
 
-# hunt runtime files
+# hunt runtime files (large / transient)
 hunt.log
-hunt.anomalies.log
-hunt.state.json
 hunt.state.json.tmp
 *.zeros.log
