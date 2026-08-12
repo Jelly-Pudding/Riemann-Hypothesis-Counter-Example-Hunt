@@ -16,16 +16,17 @@ import (
 // huntState is persisted to disk after every block so a killed process
 // resumes where it left off (losing at most the block in flight).
 type huntState struct {
-	StartT     float64   `json:"start_t"`
-	NextT      float64   `json:"next_t"`
-	ZerosFound int64     `json:"zeros_found"`
-	Blocks     int64     `json:"blocks"`
-	Evals      int64     `json:"evals"`
-	Seconds    float64   `json:"scan_seconds"`
-	Anomalies  int64     `json:"anomalies"`
-	AckDev     float64   `json:"ack_dev"`
-	CumHistory []float64 `json:"cum_history,omitempty"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	StartT     float64    `json:"start_t"`
+	NextT      float64    `json:"next_t"`
+	ZerosFound int64      `json:"zeros_found"`
+	Blocks     int64      `json:"blocks"`
+	Evals      int64      `json:"evals"`
+	Seconds    float64    `json:"scan_seconds"`
+	Anomalies  int64      `json:"anomalies"`
+	AckDev     float64    `json:"ack_dev"`
+	CumHistory []float64  `json:"cum_history,omitempty"`
+	Hist       []blockRec `json:"hist,omitempty"`
+	UpdatedAt  time.Time  `json:"updated_at"`
 }
 
 func saveState(path string, s *huntState) {
@@ -43,12 +44,14 @@ func saveState(path string, s *huntState) {
 
 // blockRec remembers a recently scanned block so a later cumulative
 // deficit can trigger a rescan of the block that actually lost the pair
-// (which is often not the block where the deficit finally trips).
+// (often not the block where the deficit finally trips). Persisted in
+// the state file so backscans survive restarts.
 type blockRec struct {
-	t0, t1 float64
-	hBase  float64 // base lattice spacing the block was scanned at
-	found  int
-	mult   int // finest full-block density multiplier already tried
+	T0    float64 `json:"t0"`
+	T1    float64 `json:"t1"`
+	HBase float64 `json:"h_base"` // base lattice spacing the block was scanned at
+	Found int     `json:"found"`
+	Mult  int     `json:"mult"` // finest full-block density multiplier tried
 }
 
 // baseline is the rolling median of recent cumulative drifts. The drift
@@ -302,7 +305,7 @@ func runHunt(args []string) {
 	}
 
 	const backWindow = 64 // recent blocks eligible for backscan
-	var hist []blockRec
+	hist := st.Hist       // survives restarts via the state file
 	lastSum := time.Now()
 	sumT0, sumZ0 := st.NextT, st.ZerosFound
 
@@ -489,8 +492,8 @@ func runHunt(args []string) {
 			// Walk oldest-first. The missing pair lives where the descent began.
 			for i := origin; i < len(hist) && dev <= -1.8; i++ {
 				b := &hist[i]
-				bExpected := nDiff(b.t0, b.t1)
-				hMinB := math.Nextafter(b.t1, math.Inf(1)) - b.t1
+				bExpected := nDiff(b.T0, b.T1)
+				hMinB := math.Nextafter(b.T1, math.Inf(1)) - b.T1
 				var last []float64
 				accept := func(m2 []float64, densLabel string) {
 					diff := float64(len(m2)) - bExpected
@@ -498,7 +501,7 @@ func runHunt(args []string) {
 						// Too many crossings means a broken scan. Never
 						// let it near the ledger.
 						alogf("REJECTED backscan t=[%.3f,%.3f] %s: %d zeros vs expected %.1f (implausibly high)",
-							b.t0, b.t1, densLabel, len(m2), bExpected)
+							b.T0, b.T1, densLabel, len(m2), bExpected)
 						return
 					}
 					if diff < -8 {
@@ -507,37 +510,37 @@ func runHunt(args []string) {
 						// (only higher counts are ever accepted) and its
 						// gaps still localize the missing pairs.
 						logf("backscan t=[%.3f,%.3f] %s found %d, %.1f short; block is tight-pair rich, finer passes follow",
-							b.t0, b.t1, densLabel, len(m2), -diff)
+							b.T0, b.T1, densLabel, len(m2), -diff)
 					}
 					last = m2
-					if len(m2) > b.found {
-						delta := len(m2) - b.found
-						b.found = len(m2)
+					if len(m2) > b.Found {
+						delta := len(m2) - b.Found
+						b.Found = len(m2)
 						st.ZerosFound += int64(delta)
-						writeZeros(m2, fmt.Sprintf("rescan of [%.3f,%.3f]: supersedes earlier entries in this range", b.t0, b.t1))
+						writeZeros(m2, fmt.Sprintf("rescan of [%.3f,%.3f]: supersedes earlier entries in this range", b.T0, b.T1))
 						cum = float64(st.ZerosFound) - nDiff(st.StartT, t1)
 						dev = cum - base
 						logf("backscan t=[%.3f,%.3f] %s recovered %d zeros, cum_drift=%+.3f dev=%+.3f",
-							b.t0, b.t1, densLabel, delta, cum, dev)
+							b.T0, b.T1, densLabel, delta, cum, dev)
 					}
 				}
 				// Build the interpolation grid once for both density passes.
 				var bgb *blockGrid
 				for _, m := range []int{2, 8} {
-					if m <= b.mult || b.hBase/float64(m) < hMinB {
+					if m <= b.Mult || b.HBase/float64(m) < hMinB {
 						continue
 					}
-					logf("backscan t=[%.3f,%.3f] pass=%dx dev=%+.3f", b.t0, b.t1, m, dev)
+					logf("backscan t=[%.3f,%.3f] pass=%dx dev=%+.3f", b.T0, b.T1, m, dev)
 					bs := time.Now()
 					if bgb == nil {
 						var e1 int64
-						bgb, e1 = buildBlockGrid(b.t0, b.t1, *workers)
+						bgb, e1 = buildBlockGrid(b.T0, b.T1, *workers)
 						st.Evals += e1
 					}
-					m2, e2 := bgb.scanZ(b.t0, b.t1, b.hBase/float64(m), *workers)
+					m2, e2 := bgb.scanZ(b.T0, b.T1, b.HBase/float64(m), *workers)
 					st.Evals += e2
 					st.Seconds += time.Since(bs).Seconds()
-					b.mult = m
+					b.Mult = m
 					accept(m2, fmt.Sprintf("%dx", m))
 					if dev > -1.8 {
 						break
@@ -548,7 +551,7 @@ func runHunt(args []string) {
 				if dev <= -1.8 && last != nil {
 					var wins [][2]float64
 					for _, th := range []float64{-1.2, -1.0, -0.8} {
-						w := localizeDeficit(b.t0, b.t1, last, th)
+						w := localizeDeficit(b.T0, b.T1, last, th)
 						if w == nil {
 							continue
 						}
@@ -563,11 +566,11 @@ func runHunt(args []string) {
 					}
 					if wins != nil {
 						logf("backscan t=[%.3f,%.3f] pass=32x direct targeted(%d windows) dev=%+.3f",
-							b.t0, b.t1, len(wins), dev)
+							b.T0, b.T1, len(wins), dev)
 						bs := time.Now()
 						merged := last
 						for _, w := range wins {
-							nm, e2 := scanBlockChunked(w[0], w[1], b.hBase/32, *workers)
+							nm, e2 := scanBlockChunked(w[0], w[1], b.HBase/32, *workers)
 							st.Evals += e2
 							merged = mergeReplace(merged, w[0], w[1], nm)
 						}
@@ -577,10 +580,10 @@ func runHunt(args []string) {
 				}
 				// A block still short after every rung is a suspect region
 				// for the anomaly report, with its best-guess windows.
-				if short := bExpected - float64(b.found); short >= 1.5 && len(suspects) < 5 {
-					s := fmt.Sprintf("t=[%.0f,%.0f] short %.1f", b.t0, b.t1, short)
+				if short := bExpected - float64(b.Found); short >= 1.5 && len(suspects) < 5 {
+					s := fmt.Sprintf("t=[%.0f,%.0f] short %.1f", b.T0, b.T1, short)
 					if last != nil {
-						if wins := localizeDeficit(b.t0, b.t1, last, -0.7); wins != nil && len(wins) <= 4 {
+						if wins := localizeDeficit(b.T0, b.T1, last, -0.7); wins != nil && len(wins) <= 4 {
 							for _, w := range wins {
 								s += fmt.Sprintf(" window[%.3f,%.3f]", w[0], w[1])
 							}
@@ -610,6 +613,7 @@ func runHunt(args []string) {
 		if len(st.CumHistory) > 256 {
 			st.CumHistory = st.CumHistory[len(st.CumHistory)-256:]
 		}
+		st.Hist = hist
 		saveState(*statePath, st)
 
 		if *summarySec > 0 && time.Since(lastSum).Seconds() >= *summarySec {
