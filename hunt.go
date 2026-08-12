@@ -167,6 +167,67 @@ func mergeReplace(mids []float64, a, b float64, repl []float64) []float64 {
 	return out
 }
 
+// probeCandidates confirms or dismisses dip candidates from a scan.
+// Stage 1: interpolation mini-scan at the finest legal lattice around
+// the candidate. Stage 2 (when stage 1 finds nothing new): direct
+// dd-grid probe, which resolves below the lattice floor. Confirmed
+// crossings are merged; each probe touches only ~7 lattice steps of
+// territory, so boundary attribution stays local and exact.
+func probeCandidates(bg *blockGrid, cands []float64, h, t0, t1 float64, mids []float64, workers int) ([]float64, int64, int) {
+	ulp := math.Nextafter(t1, math.Inf(1)) - t1
+	fine := math.Max(ulp, h/64)
+	// Cell semantics make insertion unambiguous: the dip predicate
+	// guarantees the cells flanking the candidate sample contain no
+	// known crossing, and the hidden pair must lie in exactly those
+	// cells (the candidate is the |Z| minimum sample of its dip). So
+	// zeros found inside the core zone (c-1.4h, c+1.4h) are new by
+	// construction; no distance matching against old estimates needed.
+	var evals int64
+	recovered := 0
+	lastC := math.Inf(-1)
+	for _, c := range cands {
+		if c-lastC < 8*h {
+			continue // region already probed by the previous candidate
+		}
+		lastC = c
+		zLo, zHi := math.Max(c-1.4*h, t0), math.Min(c+1.4*h, t1)
+		iLo := sort.SearchFloat64s(mids, zLo)
+		iHi := sort.SearchFloat64s(mids, zHi)
+		if iHi > iLo {
+			continue // core zone unexpectedly holds a known zero; leave to fallback
+		}
+		tryMerge := func(nm []float64) int {
+			added := 0
+			for _, z := range nm {
+				if z <= zLo || z > zHi {
+					continue
+				}
+				j := sort.SearchFloat64s(mids, z)
+				if (j < len(mids) && mids[j]-z < 0.05*h) || (j > 0 && z-mids[j-1] < 0.05*h) {
+					continue // duplicate insertion from an earlier stage
+				}
+				mids = append(mids, 0)
+				copy(mids[j+1:], mids[j:])
+				mids[j] = z
+				added++
+			}
+			return added
+		}
+		if fine < h {
+			nm, e := bg.scanZ(c-3*h, c+3*h, fine, workers)
+			evals += e
+			if a := tryMerge(nm); a > 0 {
+				recovered += a
+				continue
+			}
+		}
+		nm, e := scanBlock(c-3*h, c+3*h, 4096, workers)
+		evals += e
+		recovered += tryMerge(nm)
+	}
+	return mids, evals, recovered
+}
+
 // dipHunt finds pairs tighter than the interpolation lattice. Such a
 // pair leaves an unmistakable fingerprint: a lattice point whose |Z| is
 // tiny while the sign does not change across it (flanking samples of a
@@ -382,85 +443,53 @@ func runHunt(args []string) {
 
 		blockStart := time.Now()
 		// One NUFFT pass captures the band-limited main sum for the whole
-		// block; every scan and rescan below is interpolation against it.
+		// block. The base scan collects dip candidates as it goes: every
+		// straddled pair leaves a same-sign |Z| dip at the lattice points
+		// flanking it, so pair recovery is a handful of tiny probes
+		// instead of block-wide rescans at higher density.
 		bg, evals := buildBlockGrid(t0, t1, *workers)
-		mids, e := bg.scanZ(t0, t1, hBase, *workers)
+		mids, cands, e := bg.scan(t0, t1, hBase, *workers, true)
 		evals += e
 		expected := nDiff(t0, t1)
 
-		// Rescan ladder. The pair that survives a targeted pass is usually
-		// the one whose window the S-wobble masks while wobble windows
-		// elsewhere still flag, and relocalizing at the same threshold
-		// chases the wrong windows. Each rung therefore relaxes the window
-		// threshold, with one full-block interpolation sweep as backstop.
-		// Direct dd-grid passes (required below one ulp of t) stay
-		// targeted only.
-		hMin := math.Nextafter(t1, math.Inf(1)) - t1
 		rescans, mult := 0, 1
-		for _, p := range []struct {
-			mult     int
-			thresh   float64 // window flag level; 0 = full-block sweep
-			minDrift float64
-		}{
-			{2, -1.2, -0.9}, // classic: unmasked windows
-			{2, -0.7, -0.9}, // liberal: wobble-masked windows, still cheap
-			{8, -0.7, -0.9}, // finer grid, liberal windows
-			{8, 0, -1.3},    // full-block sweep: no blind spots
-		} {
-			drift := float64(len(mids)) - expected
-			if drift > p.minDrift {
-				break
-			}
-			h := hBase / float64(p.mult)
-			if h < hMin {
-				break // below the lattice floor; dipHunt takes over
-			}
-			var wins [][2]float64
-			mode := ""
-			if p.thresh < 0 {
-				wins = localizeDeficit(t0, t1, mids, p.thresh)
-				if wins != nil {
-					span := 0.0
-					for _, w := range wins {
-						span += w[1] - w[0]
-					}
-					if span < 0.5*(t1-t0) {
-						mode = fmt.Sprintf("targeted(%d windows, %.0f units, thresh %.1f)", len(wins), span, p.thresh)
-					} else {
-						wins = [][2]float64{{t0, t1}}
-						mode = "full"
-					}
-				}
-				if wins == nil {
-					continue // nothing flagged at this level; try the next rung
-				}
-			} else {
-				wins = [][2]float64{{t0, t1}}
-				mode = "full"
-			}
-			rescans++
-			logf("rescan block=%d pass=%dx %s drift=%+.3f", st.Blocks+1, p.mult, mode, drift)
+		if len(cands) > 0 {
 			prev := mids
-			for _, wnd := range wins {
-				nm, e2 := bg.scanZ(wnd[0], wnd[1], h, *workers)
-				evals += e2
-				mids = mergeReplace(mids, wnd[0], wnd[1], nm)
-			}
-			// A rescan may only nudge the count by the recovered pairs.
-			// Anything larger means a broken scan and is rejected.
-			d := len(mids) - len(prev)
-			if d < -2 || d > 24+4*len(wins) {
-				alogf("REJECTED rescan block=%d pass=%dx: count moved by %+d (implausible); keeping previous list",
-					st.Blocks+1, p.mult, d)
+			var e2 int64
+			var rec int
+			mids, e2, rec = probeCandidates(bg, cands, hBase, t0, t1, mids, *workers)
+			evals += e2
+			if d := len(mids) - len(prev); d < -2 || d > 64 {
+				alogf("REJECTED dip probes block=%d: count moved by %+d (implausible); keeping previous list",
+					st.Blocks+1, d)
 				mids = prev
-				break
+			} else if rec > 0 {
+				rescans++
+				logf("block=%d dip probes: %d candidates, recovered %d zeros", st.Blocks+1, len(cands), rec)
 			}
-			if mode == "full" && p.mult > mult {
-				mult = p.mult
+		}
+
+		// Fallback sweep: only when the count is still short of a pair
+		// after probing (a dip outside the collection threshold, e.g. in
+		// a locally loud stretch of Z). Rare by design.
+		hMin := math.Nextafter(t1, math.Inf(1)) - t1
+		if drift := float64(len(mids)) - expected; drift <= -1.5 && hBase/8 >= hMin {
+			rescans++
+			logf("rescan block=%d pass=8x full drift=%+.3f", st.Blocks+1, drift)
+			prev := mids
+			nm, e2 := bg.scanZ(t0, t1, hBase/8, *workers)
+			evals += e2
+			mids = mergeReplace(mids, t0, t1, nm)
+			if d := len(mids) - len(prev); d < -2 || d > 64 {
+				alogf("REJECTED rescan block=%d pass=8x: count moved by %+d (implausible); keeping previous list",
+					st.Blocks+1, d)
+				mids = prev
+			} else {
+				mult = 8
 			}
 		}
 		// Deep rung: pairs below the lattice floor leave a dip fingerprint
-		// that window localization can miss but pointwise |Z| cannot.
+		// at one-ulp sampling that nothing can mask.
 		if drift := float64(len(mids)) - expected; drift <= -1.5 {
 			logf("rescan block=%d pass=diphunt drift=%+.3f", st.Blocks+1, drift)
 			prev := mids

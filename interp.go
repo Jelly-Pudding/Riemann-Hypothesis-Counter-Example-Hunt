@@ -163,24 +163,36 @@ func (bg *blockGrid) segFor(t float64) *sInterp {
 // lattice and no interval is scanned twice or missed). Returns the
 // sign-change midpoints and the number of evaluations.
 func (bg *blockGrid) scanZ(a, b, h float64, workers int) ([]float64, int64) {
+	mids, _, evals := bg.scan(a, b, h, workers, false)
+	return mids, evals
+}
+
+// scan is scanZ with optional dip-candidate collection: same-sign local
+// minima of |Z| below a spacing-scaled threshold. A pair straddled
+// between lattice points always leaves such a dip (flanking samples
+// read |Z| of order |Z”|h^2), so collecting dips during the base pass
+// locates pair hiding spots at zero extra evaluation cost. Callers
+// confirm each candidate with a cheap probe.
+func (bg *blockGrid) scan(a, b, h float64, workers int, dips bool) ([]float64, []float64, int64) {
 	if h < math.Nextafter(b, math.Inf(1))-b {
 		// Below one ulp of t consecutive lattice points collapse onto the
 		// same float64 while theta keeps advancing, producing phantom
 		// crossings. Callers must use the direct dd-grid engine instead.
 		panic(fmt.Sprintf("scanZ: lattice spacing %g is below ulp(%g); use the direct engine", h, b))
 	}
+	dipThresh := math.Min(2e-2, math.Max(1e-6, 2000*h*h))
 	a0 := math.Ceil(a/h) * h
 	count := int(math.Floor((b-a0)/h)) + 1
 	if count < 2 {
-		return nil, 0
+		return nil, nil, 0
 	}
 	// The lattice point below a0 seeds the sign. Its interval (a0-h, a0]
 	// is counted only when a is off-lattice. When a is on the lattice
 	// that interval belongs to the neighbor scan below.
 	includeSeed := a0 > a
 	total := count + 1
-	var mids []float64
-	var prev float64
+	var mids, cands []float64
+	var prev, p2 float64
 	const chunk = 1 << 22
 	zs := make([]float64, min(total, chunk))
 	for cs := 0; cs < total; cs += chunk {
@@ -193,8 +205,9 @@ func (bg *blockGrid) scanZ(a, b, h float64, workers int) ([]float64, int64) {
 		}
 		for j := lo; j < ce-cs; j++ {
 			cur := zs[j]
-			if (prev < 0) != (cur < 0) && (includeSeed || cs+j > 1) {
-				m := a0 - h + (float64(cs+j)-0.5)*h
+			gj := cs + j
+			if (prev < 0) != (cur < 0) && (includeSeed || gj > 1) {
+				m := a0 - h + (float64(gj)-0.5)*h
 				if m < a {
 					// Seed-interval crossings belong to (a, a0]; clamp the
 					// estimate so callers' [a, b] bookkeeping stays exact.
@@ -202,10 +215,18 @@ func (bg *blockGrid) scanZ(a, b, h float64, workers int) ([]float64, int64) {
 				}
 				mids = append(mids, m)
 			}
-			prev = cur
+			if dips && gj >= 2 && math.Abs(prev) < dipThresh &&
+				math.Abs(prev) <= math.Abs(p2) && math.Abs(prev) <= math.Abs(cur) &&
+				(p2 < 0) == (cur < 0) && (p2 < 0) == (prev < 0) && len(cands) < 8192 {
+				c := a0 - h + float64(gj-1)*h
+				if c > a && c < b {
+					cands = append(cands, c)
+				}
+			}
+			p2, prev = prev, cur
 		}
 	}
-	return mids, int64(total)
+	return mids, cands, int64(total)
 }
 
 // evalRange fills zs[0:ce-cs] with Z at lattice points base + j*h for
