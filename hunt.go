@@ -13,6 +13,15 @@ import (
 	"time"
 )
 
+// devTrip is the alarm threshold on dev (cum drift vs rolling median
+// baseline). S(T) excursions of 2 to 3 lasting tens of blocks are
+// normal and the 256-block median adapts slowly, which made a -1.8
+// trigger fire on plain wobble (verified empirically: a dip-hunter
+// sweep of a "short 1.7" suspect block found zero sub-lattice dip
+// candidates). A real off-line pair adds a persistent -2 STEP on top
+// of wherever S sits, which still crosses -2.5 promptly.
+const devTrip = -2.5
+
 // huntState is persisted to disk after every block so a killed process
 // resumes where it left off (losing at most the block in flight).
 type huntState struct {
@@ -473,7 +482,7 @@ func runHunt(args []string) {
 		// deeper drop re-arms the walk.
 		var suspects []string
 		walkRecovered := false
-		if warmedUp && dev <= -1.8 && dev <= st.WalkAck-0.9 {
+		if warmedUp && dev <= devTrip && dev <= st.WalkAck-0.9 {
 			// Walk back to the step origin: the last block whose recorded
 			// cum drift was still near the baseline, plus wobble margin.
 			// Wobble can delay the trigger several blocks past the loss.
@@ -495,7 +504,7 @@ func runHunt(args []string) {
 			}
 			logf("backscan window: blocks %d..%d (drift step origin, margin 2)", origin+1, len(hist))
 			// Walk oldest-first. The missing pair lives where the descent began.
-			for i := origin; i < len(hist) && dev <= -1.8; i++ {
+			for i := origin; i < len(hist) && dev <= devTrip; i++ {
 				b := &hist[i]
 				bExpected := nDiff(b.T0, b.T1)
 				hMinB := math.Nextafter(b.T1, math.Inf(1)) - b.T1
@@ -548,13 +557,13 @@ func runHunt(args []string) {
 					st.Seconds += time.Since(bs).Seconds()
 					b.Mult = m
 					accept(m2, fmt.Sprintf("%dx", m))
-					if dev > -1.8 {
+					if dev > devTrip {
 						break
 					}
 				}
 				// Deep rung: direct dd-grid rescan of localized windows,
 				// tightest available localization, span capped.
-				if dev <= -1.8 && last != nil {
+				if dev <= devTrip && last != nil {
 					var wins [][2]float64
 					for _, th := range []float64{-1.2, -1.0, -0.8} {
 						w := localizeDeficit(b.T0, b.T1, last, th)
@@ -605,7 +614,7 @@ func runHunt(args []string) {
 		// or a rising dev re-arms it.
 		if walkRecovered {
 			st.WalkAck = 0
-		} else if dev <= -1.8 && dev <= st.WalkAck-0.9 {
+		} else if dev <= devTrip && dev <= st.WalkAck-0.9 {
 			st.WalkAck = dev
 		} else if d := dev - 0.5; d > st.WalkAck {
 			st.WalkAck = d
@@ -613,7 +622,7 @@ func runHunt(args []string) {
 
 		// Alarm only on a NEW deficit. Acknowledged ones do not repeat
 		// every block. AckDev relaxes upward as the drift recovers.
-		if warmedUp && dev <= -1.8 && dev <= st.AckDev-0.9 {
+		if warmedUp && dev <= devTrip && dev <= st.AckDev-0.9 {
 			st.Anomalies++
 			st.AckDev = dev
 			where := "no single block pins the deficit; run ./riemann check over recent heights"
