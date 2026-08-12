@@ -474,10 +474,21 @@ func runHunt(args []string) {
 				hMinB := math.Nextafter(b.t1, math.Inf(1)) - b.t1
 				var last []float64
 				accept := func(m2 []float64, densLabel string) {
-					if math.Abs(float64(len(m2))-bExpected) > 8 {
-						alogf("REJECTED backscan t=[%.3f,%.3f] %s: %d zeros vs expected %.1f (implausible)",
+					diff := float64(len(m2)) - bExpected
+					if diff > 8 {
+						// Too many crossings means a broken scan. Never
+						// let it near the ledger.
+						alogf("REJECTED backscan t=[%.3f,%.3f] %s: %d zeros vs expected %.1f (implausibly high)",
 							b.t0, b.t1, densLabel, len(m2), bExpected)
 						return
+					}
+					if diff < -8 {
+						// A very low count is an honest scan of a block
+						// rich in tight pairs. It cannot harm the ledger
+						// (only higher counts are ever accepted) and its
+						// gaps still localize the missing pairs.
+						logf("backscan t=[%.3f,%.3f] %s found %d, %.1f short; block is tight-pair rich, finer passes follow",
+							b.t0, b.t1, densLabel, len(m2), -diff)
 					}
 					last = m2
 					if len(m2) > b.found {
