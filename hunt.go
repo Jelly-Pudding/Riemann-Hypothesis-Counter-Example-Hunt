@@ -24,6 +24,7 @@ type huntState struct {
 	Seconds    float64    `json:"scan_seconds"`
 	Anomalies  int64      `json:"anomalies"`
 	AckDev     float64    `json:"ack_dev"`
+	WalkAck    float64    `json:"walk_ack"` // dev level already searched fruitlessly
 	CumHistory []float64  `json:"cum_history,omitempty"`
 	Hist       []blockRec `json:"hist,omitempty"`
 	UpdatedAt  time.Time  `json:"updated_at"`
@@ -466,9 +467,13 @@ func runHunt(args []string) {
 			cum, dev, rescans, evals, dur.Seconds(), float64(evals)/dur.Seconds(), st.ZerosFound)
 
 		// Backscan: a step-drop of ~2 in dev means a pair went missing in
-		// a recent block, not necessarily this one.
+		// a recent block, not necessarily this one. A fruitless walk
+		// acknowledges its dev level (WalkAck) so an unrecoverable
+		// deficit does not trigger a new walk every block. Only a
+		// deeper drop re-arms the walk.
 		var suspects []string
-		if warmedUp && dev <= -1.8 {
+		walkRecovered := false
+		if warmedUp && dev <= -1.8 && dev <= st.WalkAck-0.9 {
 			// Walk back to the step origin: the last block whose recorded
 			// cum drift was still near the baseline, plus wobble margin.
 			// Wobble can delay the trigger several blocks past the loss.
@@ -517,6 +522,7 @@ func runHunt(args []string) {
 						delta := len(m2) - b.Found
 						b.Found = len(m2)
 						st.ZerosFound += int64(delta)
+						walkRecovered = true
 						writeZeros(m2, fmt.Sprintf("rescan of [%.3f,%.3f]: supersedes earlier entries in this range", b.T0, b.T1))
 						cum = float64(st.ZerosFound) - nDiff(st.StartT, t1)
 						dev = cum - base
@@ -592,6 +598,17 @@ func runHunt(args []string) {
 					suspects = append(suspects, s)
 				}
 			}
+		}
+
+		// Walk acknowledgement: a fruitless walk remembers its dev level
+		// and does not re-walk until dev drops another notch. Recovery
+		// or a rising dev re-arms it.
+		if walkRecovered {
+			st.WalkAck = 0
+		} else if dev <= -1.8 && dev <= st.WalkAck-0.9 {
+			st.WalkAck = dev
+		} else if d := dev - 0.5; d > st.WalkAck {
+			st.WalkAck = d
 		}
 
 		// Alarm only on a NEW deficit. Acknowledged ones do not repeat
