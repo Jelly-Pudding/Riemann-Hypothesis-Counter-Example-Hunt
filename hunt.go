@@ -167,6 +167,54 @@ func mergeReplace(mids []float64, a, b float64, repl []float64) []float64 {
 	return out
 }
 
+// dipHunt finds pairs tighter than the interpolation lattice. Such a
+// pair leaves an unmistakable fingerprint: a lattice point whose |Z| is
+// tiny while the sign does not change across it (flanking samples of a
+// sub-lattice pair read |Z| ~ 1e-4 at one-ulp spacing). Unlike window
+// localization this cannot be masked by S wobble. Candidates are probed
+// with the direct dd-grid engine and confirmed crossings merged in.
+// Empirically validated on production leaks: block at 3002139e6 held a
+// pair with gap of exactly one ulp, found as the sole dip candidate.
+func dipHunt(bg *blockGrid, t0, t1 float64, mids []float64, workers int) ([]float64, int64, int) {
+	h := math.Nextafter(t1, math.Inf(1)) - t1 // one ulp: finest legal lattice
+	a0 := math.Ceil(t0/h) * h
+	count := int(math.Floor((t1-a0)/h)) + 1
+	if count < 3 {
+		return mids, 0, 0
+	}
+	// Flanks of a hidden pair scale like |Z''|*h^2; 1e4*h^2 sits far
+	// above that noise floor yet excludes ordinary |Z| minima.
+	dipThresh := math.Min(1e-2, math.Max(1e-6, 1e4*h*h))
+	const chunk = 1 << 22
+	zs := make([]float64, min(count, chunk))
+	var cands []float64
+	var p1, p2 float64
+	for cs := 0; cs < count; cs += chunk {
+		ce := min(count, cs+chunk)
+		bg.evalRange(a0, h, cs, ce, workers, zs)
+		for j := 0; j < ce-cs; j++ {
+			z := zs[j]
+			gj := cs + j
+			if gj >= 2 && math.Abs(p1) < dipThresh && math.Abs(p1) <= math.Abs(p2) && math.Abs(p1) <= math.Abs(z) &&
+				(p2 < 0) == (z < 0) && (p2 < 0) == (p1 < 0) && len(cands) < 4096 {
+				cands = append(cands, a0+float64(gj-1)*h)
+			}
+			p2, p1 = p1, z
+		}
+	}
+	evals := int64(count)
+	recovered := 0
+	for _, c := range cands {
+		nm, e := scanBlock(c-4*h, c+4*h, 4096, workers)
+		evals += e
+		if len(nm) >= 2 {
+			mids = mergeReplace(mids, c-4*h, c+4*h, nm)
+			recovered += len(nm)
+		}
+	}
+	return mids, evals, recovered
+}
+
 // scanBlockChunked runs the direct (non-interpolated) NUFFT scanner over
 // [a, b] at step ~h, in sub-ranges bounded to ~8M points to cap memory.
 // The direct engine's double-double grid is exact at any step size, so
@@ -314,8 +362,8 @@ func runHunt(args []string) {
 		logf("tables built n=1..%d in %.2fs", mMax, d.Seconds())
 	}
 
-	const backWindow = 64 // recent blocks eligible for backscan
-	hist := st.Hist       // survives restarts via the state file
+	const backWindow = 128 // recent blocks eligible for backscan
+	hist := st.Hist        // survives restarts via the state file
 	lastSum := time.Now()
 	sumT0, sumZ0 := st.NextT, st.ZerosFound
 
@@ -354,46 +402,22 @@ func runHunt(args []string) {
 			thresh   float64 // window flag level; 0 = full-block sweep
 			minDrift float64
 		}{
-			{2, -1.2, -0.9},  // classic: unmasked windows
-			{2, -0.7, -0.9},  // liberal: wobble-masked windows, still cheap
-			{8, -0.7, -0.9},  // finer grid, liberal windows
-			{8, 0, -1.3},     // full-block sweep: no blind spots
-			{32, -0.7, -1.7}, // direct engine on liberal windows
+			{2, -1.2, -0.9}, // classic: unmasked windows
+			{2, -0.7, -0.9}, // liberal: wobble-masked windows, still cheap
+			{8, -0.7, -0.9}, // finer grid, liberal windows
+			{8, 0, -1.3},    // full-block sweep: no blind spots
 		} {
 			drift := float64(len(mids)) - expected
 			if drift > p.minDrift {
 				break
 			}
 			h := hBase / float64(p.mult)
-			direct := h < hMin
+			if h < hMin {
+				break // below the lattice floor; dipHunt takes over
+			}
 			var wins [][2]float64
 			mode := ""
-			if direct {
-				// Direct evaluation is expensive. Use the tightest
-				// localization available and refuse unbounded spans:
-				// liberal window lists can cover a quarter of the block
-				// and a direct sweep of that costs minutes.
-				const directSpanCap = 25000.0
-				for _, th := range []float64{-1.2, -1.0, -0.8} {
-					w := localizeDeficit(t0, t1, mids, th)
-					if w == nil {
-						continue
-					}
-					span := 0.0
-					for _, x := range w {
-						span += x[1] - x[0]
-					}
-					if span <= directSpanCap {
-						wins = w
-						mode = fmt.Sprintf("targeted(%d windows, %.0f units, thresh %.1f)", len(w), span, th)
-					}
-					break // looser thresholds only grow the span
-				}
-				if wins == nil {
-					logf("rescan block=%d pass=%dx skipped: no bounded localization for direct pass; backscan/anomaly will follow up", st.Blocks+1, p.mult)
-					break
-				}
-			} else if p.thresh < 0 {
+			if p.thresh < 0 {
 				wins = localizeDeficit(t0, t1, mids, p.thresh)
 				if wins != nil {
 					span := 0.0
@@ -415,19 +439,10 @@ func runHunt(args []string) {
 				mode = "full"
 			}
 			rescans++
-			if direct {
-				mode += " direct"
-			}
 			logf("rescan block=%d pass=%dx %s drift=%+.3f", st.Blocks+1, p.mult, mode, drift)
 			prev := mids
 			for _, wnd := range wins {
-				var nm []float64
-				var e2 int64
-				if direct {
-					nm, e2 = scanBlockChunked(wnd[0], wnd[1], h, *workers)
-				} else {
-					nm, e2 = bg.scanZ(wnd[0], wnd[1], h, *workers)
-				}
+				nm, e2 := bg.scanZ(wnd[0], wnd[1], h, *workers)
 				evals += e2
 				mids = mergeReplace(mids, wnd[0], wnd[1], nm)
 			}
@@ -440,13 +455,25 @@ func runHunt(args []string) {
 				mids = prev
 				break
 			}
-			if mode == "full" && !direct && p.mult > mult {
+			if mode == "full" && p.mult > mult {
 				mult = p.mult
 			}
-			if direct && d <= 0 {
-				// A fruitless direct pass at 2048+ points per spacing is
-				// conclusive for those windows.
-				break
+		}
+		// Deep rung: pairs below the lattice floor leave a dip fingerprint
+		// that window localization can miss but pointwise |Z| cannot.
+		if drift := float64(len(mids)) - expected; drift <= -1.5 {
+			logf("rescan block=%d pass=diphunt drift=%+.3f", st.Blocks+1, drift)
+			prev := mids
+			var e2 int64
+			var rec int
+			mids, e2, rec = dipHunt(bg, t0, t1, mids, *workers)
+			evals += e2
+			if rec > 24 {
+				alogf("REJECTED diphunt block=%d: recovered %d (implausible); keeping previous list", st.Blocks+1, rec)
+				mids = prev
+			} else if rec > 0 {
+				rescans++
+				logf("rescan block=%d diphunt recovered %d zeros", st.Blocks+1, rec)
 			}
 		}
 		dur := time.Since(blockStart)
@@ -561,36 +588,31 @@ func runHunt(args []string) {
 						break
 					}
 				}
-				// Deep rung: direct dd-grid rescan of localized windows,
-				// tightest available localization, span capped.
-				if dev <= devTrip && last != nil {
-					var wins [][2]float64
-					for _, th := range []float64{-1.2, -1.0, -0.8} {
-						w := localizeDeficit(b.T0, b.T1, last, th)
-						if w == nil {
-							continue
-						}
-						span := 0.0
-						for _, x := range w {
-							span += x[1] - x[0]
-						}
-						if span <= 25000 {
-							wins = w
-						}
-						break
+				// Blocks whose densities were already tried skip the loop
+				// above; rebuild their zero list so the dip rung can run.
+				if dev <= devTrip && last == nil && b.HBase/8 >= hMinB {
+					logf("backscan t=[%.3f,%.3f] pass=8x-relist dev=%+.3f", b.T0, b.T1, dev)
+					bs := time.Now()
+					if bgb == nil {
+						var e1 int64
+						bgb, e1 = buildBlockGrid(b.T0, b.T1, *workers)
+						st.Evals += e1
 					}
-					if wins != nil {
-						logf("backscan t=[%.3f,%.3f] pass=32x direct targeted(%d windows) dev=%+.3f",
-							b.T0, b.T1, len(wins), dev)
-						bs := time.Now()
-						merged := last
-						for _, w := range wins {
-							nm, e2 := scanBlockChunked(w[0], w[1], b.HBase/32, *workers)
-							st.Evals += e2
-							merged = mergeReplace(merged, w[0], w[1], nm)
-						}
-						st.Seconds += time.Since(bs).Seconds()
-						accept(merged, "32x-direct")
+					m2, e2 := bgb.scanZ(b.T0, b.T1, b.HBase/8, *workers)
+					st.Evals += e2
+					st.Seconds += time.Since(bs).Seconds()
+					accept(m2, "8x-relist")
+				}
+				// Deep rung: dip fingerprints catch sub-lattice pairs that
+				// window localization can miss.
+				if dev <= devTrip && last != nil && bgb != nil {
+					logf("backscan t=[%.3f,%.3f] pass=diphunt dev=%+.3f", b.T0, b.T1, dev)
+					bs := time.Now()
+					merged, e2, rec := dipHunt(bgb, b.T0, b.T1, last, *workers)
+					st.Evals += e2
+					st.Seconds += time.Since(bs).Seconds()
+					if rec > 0 && rec <= 24 {
+						accept(merged, "diphunt")
 					}
 				}
 				// A block still short after every rung is a suspect region
