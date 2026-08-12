@@ -355,7 +355,32 @@ func runHunt(args []string) {
 			direct := h < hMin
 			var wins [][2]float64
 			mode := ""
-			if p.thresh < 0 {
+			if direct {
+				// Direct evaluation is expensive. Use the tightest
+				// localization available and refuse unbounded spans:
+				// liberal window lists can cover a quarter of the block
+				// and a direct sweep of that costs minutes.
+				const directSpanCap = 25000.0
+				for _, th := range []float64{-1.2, -1.0, -0.8} {
+					w := localizeDeficit(t0, t1, mids, th)
+					if w == nil {
+						continue
+					}
+					span := 0.0
+					for _, x := range w {
+						span += x[1] - x[0]
+					}
+					if span <= directSpanCap {
+						wins = w
+						mode = fmt.Sprintf("targeted(%d windows, %.0f units, thresh %.1f)", len(w), span, th)
+					}
+					break // looser thresholds only grow the span
+				}
+				if wins == nil {
+					logf("rescan block=%d pass=%dx skipped: no bounded localization for direct pass; backscan/anomaly will follow up", st.Blocks+1, p.mult)
+					break
+				}
+			} else if p.thresh < 0 {
 				wins = localizeDeficit(t0, t1, mids, p.thresh)
 				if wins != nil {
 					span := 0.0
@@ -364,21 +389,15 @@ func runHunt(args []string) {
 					}
 					if span < 0.5*(t1-t0) {
 						mode = fmt.Sprintf("targeted(%d windows, %.0f units, thresh %.1f)", len(wins), span, p.thresh)
-					} else if !direct {
+					} else {
 						wins = [][2]float64{{t0, t1}}
 						mode = "full"
-					} else {
-						wins = nil
 					}
 				}
 				if wins == nil {
-					continue // nothing (usable) flagged at this level; try the next rung
+					continue // nothing flagged at this level; try the next rung
 				}
 			} else {
-				if direct {
-					logf("rescan block=%d pass=%dx skipped: full-block direct too costly; backscan/anomaly will follow up", st.Blocks+1, p.mult)
-					break
-				}
 				wins = [][2]float64{{t0, t1}}
 				mode = "full"
 			}
@@ -524,9 +543,25 @@ func runHunt(args []string) {
 						break
 					}
 				}
-				// Deep rung: direct dd-grid rescan of localized windows only.
+				// Deep rung: direct dd-grid rescan of localized windows,
+				// tightest available localization, span capped.
 				if dev <= -1.8 && last != nil {
-					if wins := localizeDeficit(b.t0, b.t1, last, -0.7); wins != nil {
+					var wins [][2]float64
+					for _, th := range []float64{-1.2, -1.0, -0.8} {
+						w := localizeDeficit(b.t0, b.t1, last, th)
+						if w == nil {
+							continue
+						}
+						span := 0.0
+						for _, x := range w {
+							span += x[1] - x[0]
+						}
+						if span <= 25000 {
+							wins = w
+						}
+						break
+					}
+					if wins != nil {
 						logf("backscan t=[%.3f,%.3f] pass=32x direct targeted(%d windows) dev=%+.3f",
 							b.t0, b.t1, len(wins), dev)
 						bs := time.Now()
