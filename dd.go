@@ -2,12 +2,10 @@ package main
 
 import "math"
 
-// Double-double arithmetic: a value represented as an unevaluated sum
-// hi + lo of two float64s, giving ~32 significant digits. Needed because
-// the Riemann-Siegel phase theta(t) - t*ln(n) is ~4e13 at t = 3e12, where
-// a lone float64 carries an absolute error of ~0.008 rad -- fatal for
-// cos(). With double-double the phase error stays below 1e-18 rad for
-// heights past 1e20.
+// Double-double arithmetic. A value is the unevaluated sum hi + lo of
+// two float64s (~32 digits). The Riemann-Siegel phase theta(t) - t*ln(n)
+// is ~4e13 at t = 3e12 where plain float64 is off by ~0.008 rad. In
+// double-double the phase error stays below 1e-18 rad past t = 1e20.
 
 type dd struct{ hi, lo float64 }
 
@@ -67,15 +65,14 @@ func ddDiv(a, b dd) dd {
 	return ddAddD(quickTwoSum(q1, q2), q3)
 }
 
-// pi and 2*pi to double-double precision (the lo parts are the canonical
-// residuals of the float64 roundings).
+// pi and 2*pi in double-double. The lo parts are the float64 rounding residuals.
 var (
 	ddPi  = dd{3.141592653589793, 1.2246467991473532e-16}
 	dd2Pi = dd{6.283185307179586, 2.4492935982947064e-16}
 )
 
-// ln(2) and ln(2*pi) are derived at startup from the atanh series rather
-// than hardcoded, so there is no hand-typed constant to get wrong.
+// ln(2) and ln(2*pi) are computed at startup from the atanh series to
+// avoid hand-typed constants.
 var ddLn2, ddLn2Pi dd
 
 func init() {

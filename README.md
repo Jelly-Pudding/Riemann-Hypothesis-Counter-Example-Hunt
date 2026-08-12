@@ -62,6 +62,18 @@ systemctl enable --now zeta
 tail -f /home/alphaalex115/Riemann-Hypothesis-Counter-Example-Hunt/hunt.log
 ```
 
+## Updating the hunt
+
+Safe at any time. Restart loses at most one in-flight block and it resumes from hunt.state.json.
+
+```sh
+cd ~/Riemann-Hypothesis-Counter-Example-Hunt
+git pull
+GOAMD64=v3 go build -o riemann .
+```
+
+Then as root: `systemctl restart zeta`
+
 ## Normal Operation
 
 - One block line roughly every 10 seconds. Each block is 1 million height units which is about 4.28 million zeros.

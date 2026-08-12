@@ -6,12 +6,10 @@ import (
 	"sync"
 )
 
-// Iterative radix-2 complex FFT (decimation in time), forward transform:
+// Iterative radix-2 complex FFT, forward transform:
 // W[k] = sum_m a[m] * exp(-2*pi*i*k*m/n). n must be a power of 2.
-// The bit-reversal permutation is done as a parallel gather into a
-// scratch buffer (which is returned; the input slice becomes the next
-// call's scratch). Later stages parallelize across independent
-// sub-transforms, the final large-butterfly stages across butterflies.
+// Bit reversal is a parallel gather into a scratch buffer. Early stages
+// parallelize across sub-transforms, late stages across butterflies.
 
 var (
 	twMu    sync.Mutex
@@ -34,7 +32,7 @@ func fftTwiddles(n, workers int) []complex128 {
 			tw[j] = complex(c, s)
 		}
 	})
-	if len(twCache) >= 4 { // bound memory across size changes
+	if len(twCache) >= 4 {
 		twCache = map[int][]complex128{}
 	}
 	twCache[n] = tw
@@ -60,8 +58,8 @@ func putScratch(s []complex128) {
 	scratchCache[len(s)] = s
 }
 
-// fft transforms a and returns the result slice (generally a different
-// backing array). The input slice is recycled as scratch.
+// fft returns the transform in a new slice. The input slice is recycled
+// as scratch for the next call.
 func fft(a []complex128, workers int) []complex128 {
 	n := len(a)
 	if n&(n-1) != 0 {
@@ -115,7 +113,7 @@ func fft(a []complex128, workers int) []complex128 {
 }
 
 // parallelRange splits [0, n) into contiguous chunks across workers.
-// workers <= 1 (or a small n) runs inline.
+// Runs inline for workers <= 1 or small n.
 func parallelRange(n, workers int, fn func(lo, hi int)) {
 	if workers <= 1 || n < 1024 {
 		fn(0, n)

@@ -84,8 +84,8 @@ func main() {
 		expected := nDiff(t0, t1)
 		var zs []float64
 		if t1 > 1e7 {
-			// High heights: band-limited interpolation engine, escalating
-			// density until the count settles -- the anomaly investigator.
+			// High heights: interpolation engine, escalating density
+			// until the count settles.
 			spacing := 2 * math.Pi / math.Log(((t0+t1)/2)/(2*math.Pi))
 			h := math.Ldexp(1, int(math.Round(math.Log2(spacing/64))))
 			hMin := math.Nextafter(t1, math.Inf(1)) - t1

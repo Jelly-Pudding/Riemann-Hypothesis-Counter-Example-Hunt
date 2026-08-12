@@ -102,7 +102,7 @@ func Theta(t float64) float64 {
 // Z is the Hardy Z function computed from the accurate Zeta:
 // Z(t) = exp(i*theta(t)) * zeta(1/2 + it), which is real for real t.
 // Zeros of Z on the real axis are exactly the zeros of zeta on the
-// critical line. Inherits Zeta's O(t) cost -- low/moderate t only.
+// critical line. Inherits Zeta's O(t) cost so low/moderate t only.
 func Z(t float64) float64 {
 	th := ddMod2Pi(thetaDD(t))
 	return real(cmplx.Exp(complex(0, th)) * Zeta(complex(0.5, t)))
@@ -148,9 +148,9 @@ func getTables(m int) ([]dd, []float64) {
 }
 
 // ZFast is the Riemann-Siegel main sum with the first (C0) correction
-// term. Cost is O(sqrt(t)) per call; formula error is O((t/2pi)^(-3/4)),
-// which shrinks with height -- at t = 3e12 it is ~1e-9, so C0 alone is
-// plenty up there. The phase theta(t) - t*ln(n) is carried in
+// term. Cost is O(sqrt(t)) per call. Formula error is O((t/2pi)^(-3/4))
+// which shrinks with height and is ~1e-9 at t = 3e12, meaning C0 alone
+// suffices there. The phase theta(t) - t*ln(n) is carried in
 // double-double, keeping it exact far beyond t = 1e20.
 func ZFast(t float64) float64 {
 	a := math.Sqrt(t / (2 * math.Pi))

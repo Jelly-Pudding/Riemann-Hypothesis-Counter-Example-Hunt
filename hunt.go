@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -63,15 +64,14 @@ func baseline(h []float64) float64 {
 	return c[len(c)/2]
 }
 
-// localizeDeficit pins down where zeros went missing inside (t0, t1):
-// the argument principle is exact on ANY sub-interval (up to the small
-// S wobble), so a hidden pair shows as a ~-2 count deficit in the
-// sub-window containing it. Staggered windows (width 1/16 block, step
-// 1/32) guarantee any pair sits fully inside at least one window.
-// Returned windows are merged and snapped outward to midpoints between
-// found zeros, which are sign-stable boundaries (a hidden pair flips
-// nothing: it contributes an even number of crossings).
-func localizeDeficit(t0, t1 float64, mids []float64) [][2]float64 {
+// localizeDeficit finds sub-windows of (t0, t1) whose zero count falls
+// short of the argument-principle count. A hidden pair shows as ~-2 in
+// the staggered window containing it. Windows are merged and snapped
+// outward to midpoints between found zeros (sign-stable boundaries).
+// thresh is the flag level: -1.2 catches an unmasked pair, liberal
+// values like -0.7 also catch wobble-masked pairs at the cost of extra
+// wobble windows.
+func localizeDeficit(t0, t1 float64, mids []float64, thresh float64) [][2]float64 {
 	// Window size targets ~16k zeros: large enough that the S(T) wobble
 	// (order 1) cannot mask a deficit of 2, small enough to pin a pair
 	// to a thin slice of the block.
@@ -92,7 +92,7 @@ func localizeDeficit(t0, t1 float64, mids []float64) [][2]float64 {
 		b := math.Min(a+w, t1)
 		lo := sort.SearchFloat64s(mids, a)
 		hi := sort.SearchFloat64s(mids, b)
-		if float64(hi-lo)-nDiff(a, b) <= -1.2 {
+		if float64(hi-lo)-nDiff(a, b) <= thresh {
 			flagged = append(flagged, [2]float64{a, b})
 		}
 	}
@@ -201,12 +201,9 @@ func runHunt(args []string) {
 	block := fs.Float64("block", 1000000, "height covered per block (one log line each)")
 	end := fs.Float64("end", 0, "stop at this height (0 = run forever)")
 	workers := fs.Int("workers", runtime.NumCPU(), "parallel scan workers")
-	// Close zero pairs follow GUE repulsion, P(gap < x*mean) ~ 0.27x^3:
-	// a base scan at s points per spacing straddles ~N*0.27/s^3 pairs.
-	// At the default 100k block (~428k zeros at t=3e12), s=64 leaves
-	// ~0.4 misses per block, so most blocks pass in one pass and the
-	// 2x/8x/32x ladder only works the stragglers. Empirically cheaper
-	// than a coarser base that escalates every block.
+	// Close pairs follow GUE repulsion, P(gap < x*mean) ~ 0.27x^3. A base
+	// scan at s points per spacing straddles ~N*0.27/s^3 pairs, which the
+	// rescan ladder recovers.
 	stepdiv := fs.Float64("stepdiv", 64, "scan points per mean zero spacing")
 	statePath := fs.String("state", "hunt.state.json", "state file for resume")
 	logPath := fs.String("log", "hunt.log", "append-only log file (every block)")
@@ -330,54 +327,60 @@ func runHunt(args []string) {
 		evals += e
 		expected := nDiff(t0, t1)
 
-		// Local escalation: a shortfall that the argument principle can
-		// LOCALIZE is a close pair straddled by the lattice -- chase it
-		// even when S-wobble partly masks it (down to drift -0.9). Pure
-		// wobble is not localizable and is left alone. Lattice spacing
-		// below one ulp of t cannot exist (points would collapse onto the
-		// same float64), so deeper passes switch to the direct dd-grid
-		// engine on the localized windows only.
+		// Rescan ladder. The pair that survives a targeted pass is usually
+		// the one whose window the S-wobble masks while wobble windows
+		// elsewhere still flag, and relocalizing at the same threshold
+		// chases the wrong windows. Each rung therefore relaxes the window
+		// threshold, with one full-block interpolation sweep as backstop.
+		// Direct dd-grid passes (required below one ulp of t) stay
+		// targeted only.
 		hMin := math.Nextafter(t1, math.Inf(1)) - t1
 		rescans, mult := 0, 1
 		for _, p := range []struct {
 			mult     int
+			thresh   float64 // window flag level; 0 = full-block sweep
 			minDrift float64
 		}{
-			// Cheap interpolation passes chase any localizable deficit;
-			// expensive direct passes require most of a pair (-1.7) to
-			// still be missing -- a lone -1.0 after the 8x pass is
-			// almost always S wobble, not a hidden pair.
-			{2, -0.9}, {8, -0.9}, {32, -1.7}, {128, -1.7},
+			{2, -1.2, -0.9},  // classic: unmasked windows
+			{2, -0.7, -0.9},  // liberal: wobble-masked windows, still cheap
+			{8, -0.7, -0.9},  // finer grid, liberal windows
+			{8, 0, -1.3},     // full-block sweep: no blind spots
+			{32, -0.7, -1.7}, // direct engine on liberal windows
 		} {
 			drift := float64(len(mids)) - expected
 			if drift > p.minDrift {
 				break
 			}
-			wins := localizeDeficit(t0, t1, mids)
+			h := hBase / float64(p.mult)
+			direct := h < hMin
+			var wins [][2]float64
 			mode := ""
-			if wins == nil {
-				if drift > -2.5 {
-					break // plain S wobble: nothing localizable to chase
+			if p.thresh < 0 {
+				wins = localizeDeficit(t0, t1, mids, p.thresh)
+				if wins != nil {
+					span := 0.0
+					for _, w := range wins {
+						span += w[1] - w[0]
+					}
+					if span < 0.5*(t1-t0) {
+						mode = fmt.Sprintf("targeted(%d windows, %.0f units, thresh %.1f)", len(wins), span, p.thresh)
+					} else if !direct {
+						wins = [][2]float64{{t0, t1}}
+						mode = "full"
+					} else {
+						wins = nil
+					}
+				}
+				if wins == nil {
+					continue // nothing (usable) flagged at this level; try the next rung
+				}
+			} else {
+				if direct {
+					logf("rescan block=%d pass=%dx skipped: full-block direct too costly; backscan/anomaly will follow up", st.Blocks+1, p.mult)
+					break
 				}
 				wins = [][2]float64{{t0, t1}}
 				mode = "full"
-			} else {
-				span := 0.0
-				for _, w := range wins {
-					span += w[1] - w[0]
-				}
-				if span > 0.5*(t1-t0) {
-					wins = [][2]float64{{t0, t1}}
-					mode = "full"
-				} else {
-					mode = fmt.Sprintf("targeted(%d windows, %.0f units)", len(wins), span)
-				}
-			}
-			h := hBase / float64(p.mult)
-			direct := h < hMin
-			if direct && mode == "full" {
-				logf("rescan block=%d pass=%dx skipped: full-block direct too costly; backscan/anomaly will follow up", st.Blocks+1, p.mult)
-				break
 			}
 			rescans++
 			if direct {
@@ -396,8 +399,8 @@ func runHunt(args []string) {
 				evals += e2
 				mids = mergeReplace(mids, wnd[0], wnd[1], nm)
 			}
-			// A rescan may only nudge the count by the recovered pairs;
-			// anything larger means a broken scan -- refuse to believe it.
+			// A rescan may only nudge the count by the recovered pairs.
+			// Anything larger means a broken scan and is rejected.
 			d := len(mids) - len(prev)
 			if d < -2 || d > 24+4*len(wins) {
 				alogf("REJECTED rescan block=%d pass=%dx: count moved by %+d (implausible); keeping previous list",
@@ -410,8 +413,7 @@ func runHunt(args []string) {
 			}
 			if direct && d <= 0 {
 				// A fruitless direct pass at 2048+ points per spacing is
-				// conclusive: nothing is hiding in those windows. Deeper
-				// passes on the same evidence would chase wobble.
+				// conclusive for those windows.
 				break
 			}
 		}
@@ -432,29 +434,22 @@ func runHunt(args []string) {
 		cum := float64(st.ZerosFound) - nDiff(st.StartT, t1)
 		base := baseline(st.CumHistory)
 		dev := cum - base
-		// Until the rolling baseline has enough history, dev equals raw
-		// cum drift, which slides around with plain S(T) wander -- global
-		// triggers would fire spuriously. During warm-up, rely on the
-		// per-block checks (which already escalate at drift <= -1.5).
+		// Until the baseline has history, dev equals raw cum drift and
+		// S(T) wander would fire global triggers spuriously. During
+		// warm-up only the per-block checks run.
 		warmedUp := len(st.CumHistory) >= 20
 
 		logf("block=%d t=[%.3f,%.3f] zeros=%d expected=%.3f drift=%+.3f cum_drift=%+.3f dev=%+.3f rescans=%d evals=%d dur=%.2fs rate=%.0f/s total_zeros=%d",
 			st.Blocks, t0, t1, len(mids), expected, float64(len(mids))-expected,
 			cum, dev, rescans, evals, dur.Seconds(), float64(evals)/dur.Seconds(), st.ZerosFound)
 
-		// Backscan: a step-drop of ~2 in the drift means a pair went
-		// missing somewhere recently -- not necessarily in this block.
-		// Rescan the recent window at finer density until it clears; a
-		// real step lives within a few blocks of the trigger, so give up
-		// after several consecutive fruitless blocks (S wander, not a
-		// missing pair, is then the likely cause).
+		// Backscan: a step-drop of ~2 in dev means a pair went missing in
+		// a recent block, not necessarily this one.
+		var suspects []string
 		if warmedUp && dev <= -1.8 {
-			// Walk back to the STEP ORIGIN, not a fixed number of blocks:
-			// the block where the drift began descending is where the pair
-			// went missing, and wobble can delay the trigger by several
-			// blocks (a real pair sat 7 blocks behind the trigger in
-			// soak testing). The origin is the last block whose recorded
-			// cum drift was still near the baseline, with wobble margin.
+			// Walk back to the step origin: the last block whose recorded
+			// cum drift was still near the baseline, plus wobble margin.
+			// Wobble can delay the trigger several blocks past the loss.
 			origin := 0
 			ch := st.CumHistory
 			off := len(ch) - (len(hist) - 1) // hist's last entry has no cum recorded yet
@@ -472,8 +467,7 @@ func runHunt(args []string) {
 				origin = 0
 			}
 			logf("backscan window: blocks %d..%d (drift step origin, margin 2)", origin+1, len(hist))
-			// Walk oldest-first: the missing pair lives where the descent
-			// BEGAN, so the origin end of the window is the best bet.
+			// Walk oldest-first. The missing pair lives where the descent began.
 			for i := origin; i < len(hist) && dev <= -1.8; i++ {
 				b := &hist[i]
 				bExpected := nDiff(b.t0, b.t1)
@@ -497,8 +491,7 @@ func runHunt(args []string) {
 							b.t0, b.t1, densLabel, delta, cum, dev)
 					}
 				}
-				// Build the interpolation grid once; both density passes
-				// reuse it (the grid resolution is density-independent).
+				// Build the interpolation grid once for both density passes.
 				var bgb *blockGrid
 				for _, m := range []int{2, 8} {
 					if m <= b.mult || b.hBase/float64(m) < hMinB {
@@ -520,11 +513,9 @@ func runHunt(args []string) {
 						break
 					}
 				}
-				// Deep rung: direct dd-grid rescan of localized windows only
-				// (a full-block direct pass would take an hour; a real pair
-				// localizes, pure wobble does not).
+				// Deep rung: direct dd-grid rescan of localized windows only.
 				if dev <= -1.8 && last != nil {
-					if wins := localizeDeficit(b.t0, b.t1, last); wins != nil {
+					if wins := localizeDeficit(b.t0, b.t1, last, -0.7); wins != nil {
 						logf("backscan t=[%.3f,%.3f] pass=32x direct targeted(%d windows) dev=%+.3f",
 							b.t0, b.t1, len(wins), dev)
 						bs := time.Now()
@@ -538,16 +529,33 @@ func runHunt(args []string) {
 						accept(merged, "32x-direct")
 					}
 				}
+				// A block still short after every rung is a suspect region
+				// for the anomaly report, with its best-guess windows.
+				if short := bExpected - float64(b.found); short >= 1.5 && len(suspects) < 5 {
+					s := fmt.Sprintf("t=[%.0f,%.0f] short %.1f", b.t0, b.t1, short)
+					if last != nil {
+						if wins := localizeDeficit(b.t0, b.t1, last, -0.7); wins != nil && len(wins) <= 4 {
+							for _, w := range wins {
+								s += fmt.Sprintf(" window[%.3f,%.3f]", w[0], w[1])
+							}
+						}
+					}
+					suspects = append(suspects, s)
+				}
 			}
 		}
 
-		// Alarm only on a NEW deficit (acknowledged ones don't repeat
-		// every block); AckDev relaxes upward as the drift recovers.
+		// Alarm only on a NEW deficit. Acknowledged ones do not repeat
+		// every block. AckDev relaxes upward as the drift recovers.
 		if warmedUp && dev <= -1.8 && dev <= st.AckDev-0.9 {
 			st.Anomalies++
 			st.AckDev = dev
-			alogf("ANOMALY t<=%.6f cum_drift=%+.3f dev=%+.3f vs baseline=%+.3f -- deficit of ~2 survived backscans of the last %d blocks; an off-line zero pair would look exactly like this. Verify independently (mpmath/other hardware) before celebrating.",
-				t1, cum, dev, base, len(hist))
+			where := "no single block pins the deficit; run ./riemann check over recent heights"
+			if len(suspects) > 0 {
+				where = "suspect regions: " + strings.Join(suspects, "; ")
+			}
+			alogf("ANOMALY t<=%.6f cum_drift=%+.3f dev=%+.3f baseline=%+.3f. Deficit survived all rescans of the last %d blocks. %s. Investigate with ./riemann check <t0> <t1>, then verify independently (mpmath) before announcing.",
+				t1, cum, dev, base, len(hist), where)
 		} else if d := dev - 0.5; d > st.AckDev {
 			st.AckDev = d
 		}

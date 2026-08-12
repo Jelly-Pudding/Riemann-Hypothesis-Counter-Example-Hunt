@@ -268,7 +268,7 @@ func TestLocalizeDeficit(t *testing.T) {
 	victim := len(mids) / 3
 	gone := mids[victim]
 	cut := append(append([]float64{}, mids[:victim]...), mids[victim+4:]...)
-	wins := localizeDeficit(t0, t1, cut)
+	wins := localizeDeficit(t0, t1, cut, -1.2)
 	if wins == nil {
 		t.Fatal("localizeDeficit flagged nothing despite a missing pair")
 	}
@@ -296,7 +296,7 @@ func TestLocalizeDeficit(t *testing.T) {
 		t.Errorf("mergeReplace restore: %d zeros, want %d", len(cut), len(mids))
 	}
 	// Tiny blocks: refuse to localize.
-	if w := localizeDeficit(7000, 7010, mids[:9]); w != nil {
+	if w := localizeDeficit(7000, 7010, mids[:9], -1.2); w != nil {
 		t.Errorf("localizeDeficit should return nil at tiny scale, got %v", w)
 	}
 }

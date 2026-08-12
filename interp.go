@@ -5,17 +5,14 @@ import (
 	"math"
 )
 
-// Band-limited interpolation of the Riemann-Siegel main sum -- the
-// second half of the Odlyzko-Schonhage method (the half Gourdon's
-// record verification used to make rescans free).
+// Band-limited interpolation of the Riemann-Siegel main sum.
 //
-// The main sum S(t) = sum_{n<=m} n^{-1/2} e^{-i t ln n} is band-limited:
-// its spectrum lives in [-ln m, 0]. Sampled at interpSigma times the
-// complex Nyquist rate (spacing 2pi/(sigma*ln m) -- about 1.25 samples
-// per zero spacing), S is reconstructed anywhere by a Gaussian-tapered
-// sinc kernel over 2*interpL neighboring samples. One cheap NUFFT pass
-// then supports unlimited re-evaluation at ~100ns per point, so dense
-// sign scans and close-pair hunts no longer touch the 690k-term sum.
+// S(t) = sum_{n<=m} n^{-1/2} e^{-i t ln n} has spectrum in [-ln m, 0].
+// Sampled at interpSigma times the complex Nyquist rate (spacing
+// 2pi/(sigma*ln m), about 1.25 samples per zero spacing) it can be
+// reconstructed anywhere with a Gaussian-tapered sinc kernel over
+// 2*interpL neighboring samples. One NUFFT pass per block then supports
+// re-evaluation at any t without touching the full sum.
 
 const (
 	interpSigma = 2.5 // oversampling vs complex Nyquist
@@ -167,10 +164,9 @@ func (bg *blockGrid) segFor(t float64) *sInterp {
 // sign-change midpoints and the number of evaluations.
 func (bg *blockGrid) scanZ(a, b, h float64, workers int) ([]float64, int64) {
 	if h < math.Nextafter(b, math.Inf(1))-b {
-		// Below one ulp of t, consecutive lattice points collapse onto
-		// the same float64 while the theta expansion keeps advancing --
-		// producing millions of phantom crossings. Callers must switch
-		// to the direct dd-grid engine instead.
+		// Below one ulp of t consecutive lattice points collapse onto the
+		// same float64 while theta keeps advancing, producing phantom
+		// crossings. Callers must use the direct dd-grid engine instead.
 		panic(fmt.Sprintf("scanZ: lattice spacing %g is below ulp(%g); use the direct engine", h, b))
 	}
 	a0 := math.Ceil(a/h) * h
@@ -178,10 +174,9 @@ func (bg *blockGrid) scanZ(a, b, h float64, workers int) ([]float64, int64) {
 	if count < 2 {
 		return nil, 0
 	}
-	// The lattice point below a0 seeds the sign. Its interval
-	// (a0-h, a0] is counted only when a is off-lattice (then this call
-	// owns the sliver (a, a0]); when a IS a lattice point that interval
-	// belongs to the neighbor below, which scanned up to a itself.
+	// The lattice point below a0 seeds the sign. Its interval (a0-h, a0]
+	// is counted only when a is off-lattice. When a is on the lattice
+	// that interval belongs to the neighbor scan below.
 	includeSeed := a0 > a
 	total := count + 1
 	var mids []float64

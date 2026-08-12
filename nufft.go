@@ -2,24 +2,20 @@ package main
 
 import "math"
 
-// nufft1 is a type-1 (nonuniform -> uniform) NUFFT with Gaussian
-// gridding (Dutt-Rokhlin / Greengard-Lee style):
+// nufft1 is a type-1 NUFFT with Gaussian gridding:
 //
 //	f[j] = sum_n c[n] * exp(i * (j - R/2) * x[n]),   j = 0..R-1
 //
-// for arbitrary frequencies x[n] (any real, treated mod 2pi). Each
-// source is spread onto a 2x-oversampled length-Mr grid with a
-// truncated Gaussian of half-width Msp points, one FFT evaluates all
-// modes, and dividing by the Gaussian's transform undoes the smoothing.
+// for arbitrary real frequencies x[n] (treated mod 2pi). Sources are
+// spread onto a 2x-oversampled length-Mr grid with a truncated Gaussian
+// of half-width Msp, one FFT evaluates all modes, and dividing by the
+// Gaussian transform undoes the smoothing.
 //
-// Cost: O(m*Msp + Mr log Mr) instead of O(m*R). With Msp = 14 and
-// tau = sqrt(2)*pi*Msp/Mr^2, truncation and aliasing errors balance at
-// ~exp(-pi*Msp/sqrt(2)) ~ 3e-14 relative to sum|c| (validated by test
-// against direct summation).
+// Cost O(m*Msp + Mr log Mr). With Msp = 14 and tau = sqrt(2)*pi*Msp/Mr^2
+// truncation and aliasing balance at ~3e-14 relative to sum|c|.
 //
-// Spreading is parallelized race-free by bucketing sources by grid
-// cell and sweeping even-numbered then odd-numbered buckets
-// (checkerboard): writes from same-parity buckets cannot overlap
+// Spreading is parallelized by bucketing sources by grid cell and
+// sweeping even then odd buckets. Same-parity buckets cannot overlap
 // because the bucket width exceeds twice the kernel half-width.
 func nufft1(x []float64, c []complex128, R, workers int) []complex128 {
 	const Msp = 14
@@ -32,7 +28,7 @@ func nufft1(x []float64, c []complex128, R, workers int) []complex128 {
 	mask := Mr - 1
 	m := len(x)
 
-	// E3[l] = exp(-(l*delta)^2 / 4tau), the source-independent factor.
+	// E3[l] = exp(-(l*delta)^2 / 4tau), source independent.
 	var E3 [Msp + 1]float64
 	for l := 0; l <= Msp; l++ {
 		d := float64(l) * delta
@@ -62,8 +58,8 @@ func nufft1(x []float64, c []complex128, R, workers int) []complex128 {
 			spreadOne(w, i0, (u-float64(i0))*delta, c[n])
 		}
 	} else {
-		// Bucket sources by cell so same-parity buckets write to
-		// disjoint cell ranges (bucket width Mr/nb >= 4*Msp > 2*Msp).
+		// Bucket width Mr/nb >= 4*Msp so same-parity buckets write to
+		// disjoint cell ranges.
 		shift := 0
 		for 1<<shift < Mr/nb {
 			shift++

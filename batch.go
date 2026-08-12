@@ -6,19 +6,15 @@ import (
 )
 
 // ZBlock evaluates the Hardy Z function on the uniform grid
-// t_j = t0 + j*h, j = 0..count-1, sharing work across the whole grid.
+// t_j = t0 + j*h, j = 0..count-1.
 //
-// The Riemann-Siegel main sum at every grid point needs
-// cos(theta(t_j) - t_j*ln n) for n = 1..m. Split the phase:
+// Phase split per term:
 //
 //	e^{i(theta_j - t_j ln n)} = e^{i theta_j} * e^{-i t0 ln n} * (e^{-i h ln n})^j
 //
-// For fixed n the j-dependence is a FIXED complex rotation, so each term
-// costs one complex multiply per grid point instead of a double-double
-// phase reduction plus a cosine (~60x cheaper). The two anchor angles
-// are still computed in double-double, so nothing is lost at large t;
-// rotation drift after k steps is ~k*1e-16 rad, harmless below ~10^7
-// points per call.
+// For fixed n the j-dependence is a fixed complex rotation. Anchor
+// angles are computed in double-double. Rotation drift after k steps is
+// ~k*1e-16 rad, fine below ~1e7 points per call.
 func ZBlock(t0, h float64, count, workers int) []float64 {
 	out := make([]float64, count)
 	j0 := 0
@@ -63,10 +59,10 @@ func parallelChunks(m, workers int, fn func(w, nLo, nHi int)) {
 	wg.Wait()
 }
 
-// gridT returns t0 + j*h exactly, as a double-double. Grid points are
-// generally not representable as a single float64, and at t ~ 3e12 the
-// rounding (~5e-4) would smear the phase by ~1e-2 rad if ignored: the
-// anchors, theta, and the recurrence must all use the SAME exact t.
+// gridT returns t0 + j*h exactly as a double-double. Grid points are not
+// generally representable in float64. At t ~ 3e12 the rounding (~5e-4)
+// would smear the phase by ~1e-2 rad, and anchors, theta, and the
+// recurrence must all use the same exact t.
 func gridT(t0, h float64, j int) dd {
 	return ddAddD(twoProd(h, float64(j)), t0)
 }
@@ -102,13 +98,10 @@ func zBlockSegment(t0, h float64, j0, j1, m, workers int, out []float64) {
 	}
 }
 
-// zBlockChunkFFT is the Odlyzko-Schonhage-style evaluation: the main sum
-// is a sum of m pure tones with frequencies -h*ln n, so one type-1 NUFFT
-// evaluates it at every grid point simultaneously. The anchor phase at
-// the chunk midpoint and the tone frequencies are computed in
-// double-double, exactly like the rotation path.
 // computeS fills dst with the main sum S(t_j) = sum_n rs[n]*e^{-i t_j ln n}
-// at t_j = t0 + (j0+j)*h exactly, for j = 0..len(dst)-1, via one NUFFT.
+// at t_j = t0 + (j0+j)*h exactly, via one NUFFT. The main sum is a sum of
+// pure tones with frequencies -h*ln n. Anchor phase and frequencies are
+// computed in double-double.
 func computeS(t0, h float64, j0, count, workers int, x []float64, ln []dd, rs []float64, dst []complex128) {
 	m := len(x)
 	tMid := gridT(t0, h, j0+count/2)
@@ -128,12 +121,11 @@ func zBlockChunkFFT(t0, h float64, j0, j1, m, workers int, x []float64, ln []dd,
 	S := make([]complex128, count)
 	computeS(t0, h, j0, count, workers, x, ln, rs, S)
 
-	// Combine: Z = 2*Re(e^{i theta}*S) + remainder. theta is evaluated by
-	// a quadratic Taylor expansion re-anchored (in full double-double) at
-	// window centers: theta(tc+kh) = theta_c + k*(h*ln(tc/2pi)/2) + k^2*h^2/(4tc),
-	// with the cubic term |theta'''|(span/2)^3/6 = span^3/(96 tc^2) kept
-	// below 1e-9 by the window-span choice. The smooth C0 remainder is
-	// interpolated quadratically over the same window.
+	// Combine: Z = 2*Re(e^{i theta}*S) + remainder. theta uses a quadratic
+	// Taylor expansion re-anchored in double-double at window centers:
+	// theta(tc+kh) = theta_c + k*(h*ln(tc/2pi)/2) + k^2*h^2/(4tc). The
+	// window span keeps the cubic term span^3/(96 tc^2) below 1e-9. The
+	// C0 remainder is interpolated quadratically over the same window.
 	win := count
 	if s := math.Cbrt(9.6e-8*tMid.hi*tMid.hi) / h; s < float64(count) {
 		win = int(s)
