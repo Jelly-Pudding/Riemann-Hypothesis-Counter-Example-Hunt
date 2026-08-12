@@ -90,7 +90,7 @@ func (si *sInterp) initKernel() {
 
 // evalB reconstructs the demodulated (baseband) sum at fractional
 // sample coordinate u. Gaussian-tapered sinc; the Gaussian is split as
-// exp(-(f-l)^2/a2) = E1 * E2^l * e3[|l|] so the loop is two exps total.
+// exp(-(f-l)^2/a2) = E1 * E2^l * e3[|l|] so the setup is two exps total.
 func (si *sInterp) evalB(u float64) complex128 {
 	j0 := int(u)
 	f := u - float64(j0)
@@ -103,7 +103,12 @@ func (si *sInterp) evalB(u float64) complex128 {
 	s0 := math.Sin(math.Pi*f) / math.Pi
 	e1 := math.Exp(-f * f / si.a2)
 	e2 := math.Exp(2 * f / si.a2)
-	p := e1 * s0
+	return si.taps(j0, f, e1*s0, e2)
+}
+
+// taps is the full-kernel tap loop given precomputed taper factors:
+// p = exp(-f^2/a2)*sin(pi f)/pi and e2 = exp(2f/a2).
+func (si *sInterp) taps(j0 int, f, p, e2 float64) complex128 {
 	var acc complex128
 	// l = 0, -1, ..., -(interpL-1)
 	q, sign := p, 1.0
@@ -123,21 +128,9 @@ func (si *sInterp) evalB(u float64) complex128 {
 	return acc
 }
 
-// evalBF is evalB with the truncated fast kernel (interpF taps per side,
+// tapsF is taps with the truncated fast kernel (interpF taps per side,
 // error ~1.2e-5). Same structure, narrower taper.
-func (si *sInterp) evalBF(u float64) complex128 {
-	j0 := int(u)
-	f := u - float64(j0)
-	if f < 1e-9 {
-		return si.B[j0]
-	}
-	if f > 1-1e-9 {
-		return si.B[j0+1]
-	}
-	s0 := math.Sin(math.Pi*f) / math.Pi
-	e1 := math.Exp(-f * f / si.a2f)
-	e2 := math.Exp(2 * f / si.a2f)
-	p := e1 * s0
+func (si *sInterp) tapsF(j0 int, f, p, e2 float64) complex128 {
 	var acc complex128
 	q, sign := p, 1.0
 	e2inv := 1 / e2
@@ -298,6 +291,30 @@ func (bg *blockGrid) evalRange(base, h float64, cs, ce, workers int, zs []float6
 		var q0, q1, q2 float64
 		var kc int
 		var uA, du float64
+		// The lattice is uniform, so every transcendental in the loop
+		// advances by a constant increment and runs as a recurrence:
+		// the oscillation phase e^{i ph(k)} is a rotation advanced by a
+		// step that itself rotates by the constant chirp twist (re-synced
+		// from the exact dd phase every resyncN points, drift ~1e-10 rad),
+		// and the kernel taper factors sin(pi f), exp(-f^2/a2), exp(2f/a2)
+		// advance per point and re-seed exactly on every f wrap (every
+		// ~1/du points), so per-point transcendental cost is amortized out.
+		const resyncN = 1 << 18
+		var rotR, rotI, stR, stI, twR, twI float64
+		sync := 0
+		a2 := si.a2
+		var kSin, kCos, kE1, kGf, kE2 float64
+		lastJ0 := math.MinInt32
+		var sD, cD, c1, c2, c3 float64
+		phaseInit := func(k float64) {
+			s, c := math.Sincos(ddMod2Pi(ddAddD(ddAdd(thC, ddMulD(A, k)), Bq*k*k)))
+			rotR, rotI = c, s
+			s, c = math.Sincos(ddMod2Pi(ddAddD(A, Bq*(2*k+1))))
+			stR, stI = c, s
+			s, c = math.Sincos(2 * Bq)
+			twR, twI = c, s
+			sync = 0
+		}
 		for j := lo; j < hi; j++ {
 			t := base + float64(cs+j)*h
 			if t >= si.segB && si != bg.segs[len(bg.segs)-1] {
@@ -340,16 +357,50 @@ func (bg *blockGrid) evalRange(base, h float64, cs, ce, workers int, zs []float6
 				// too, sub-ulp lattices produce no phantom crossings.
 				uA = (base - si.tA) / si.hi
 				du = h / si.hi
+				if fast {
+					a2 = si.a2f
+				} else {
+					a2 = si.a2
+				}
+				sD, cD = math.Sincos(math.Pi * du)
+				c1 = math.Exp(-du * du / a2)
+				c2 = c1 * c1
+				c3 = math.Exp(2 * du / a2)
+				lastJ0 = math.MinInt32
+				phaseInit(float64(cs + j - kc))
 			}
 			k := float64(cs + j - kc)
-			ph := ddMod2Pi(ddAddD(ddAdd(thC, ddMulD(A, k)), Bq*k*k))
-			wi, wr := math.Sincos(ph)
+			if sync >= resyncN {
+				phaseInit(k)
+			}
+			wr, wi := rotR, rotI
+			rotR, rotI = rotR*stR-rotI*stI, rotR*stI+rotI*stR
+			stR, stI = stR*twR-stI*twI, stR*twI+stI*twR
+			sync++
 			u := uA + float64(cs+j)*du
-			var S complex128
-			if fast {
-				S = si.evalBF(u)
+			j0 := int(u)
+			f := u - float64(j0)
+			if j0 != lastJ0 {
+				kSin, kCos = math.Sincos(math.Pi * f)
+				kE1 = math.Exp(-f * f / a2)
+				kGf = math.Exp(-2 * f * du / a2)
+				kE2 = math.Exp(2 * f / a2)
+				lastJ0 = j0
 			} else {
-				S = si.evalB(u)
+				kSin, kCos = kSin*cD+kCos*sD, kCos*cD-kSin*sD
+				kE1 *= kGf * c1
+				kGf *= c2
+				kE2 *= c3
+			}
+			var S complex128
+			if f < 1e-9 {
+				S = si.B[j0]
+			} else if f > 1-1e-9 {
+				S = si.B[j0+1]
+			} else if fast {
+				S = si.tapsF(j0, f, kE1*kSin/math.Pi, kE2)
+			} else {
+				S = si.taps(j0, f, kE1*kSin/math.Pi, kE2)
 			}
 			zs[j] = 2*(wr*real(S)-wi*imag(S)) + (q0 + k*(q1+k*q2))
 		}
