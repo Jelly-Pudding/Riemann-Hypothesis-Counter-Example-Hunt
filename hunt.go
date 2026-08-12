@@ -25,18 +25,22 @@ const devTrip = -2.5
 // huntState is persisted to disk after every block so a killed process
 // resumes where it left off (losing at most the block in flight).
 type huntState struct {
-	StartT     float64    `json:"start_t"`
-	NextT      float64    `json:"next_t"`
-	ZerosFound int64      `json:"zeros_found"`
-	Blocks     int64      `json:"blocks"`
-	Evals      int64      `json:"evals"`
-	Seconds    float64    `json:"scan_seconds"`
-	Anomalies  int64      `json:"anomalies"`
-	AckDev     float64    `json:"ack_dev"`
-	WalkAck    float64    `json:"walk_ack"` // dev level already searched fruitlessly
-	CumHistory []float64  `json:"cum_history,omitempty"`
-	Hist       []blockRec `json:"hist,omitempty"`
-	UpdatedAt  time.Time  `json:"updated_at"`
+	StartT      float64    `json:"start_t"`
+	NextT       float64    `json:"next_t"`
+	ZerosFound  int64      `json:"zeros_found"`
+	Blocks      int64      `json:"blocks"`
+	Evals       int64      `json:"evals"`
+	Seconds     float64    `json:"scan_seconds"`
+	Anomalies   int64      `json:"anomalies"`
+	AckDev      float64    `json:"ack_dev"`
+	WalkAck     float64    `json:"walk_ack"`     // dev level already searched fruitlessly
+	AnchorT     float64    `json:"anchor_t"`     // last Turing-certified anchor
+	AnchorN     int64      `json:"anchor_n"`     // certified ABSOLUTE zero count at AnchorT
+	AnchorFound int64      `json:"anchor_found"` // cumulative found count at AnchorT
+	CertAck     int64      `json:"cert_ack"`     // certified deficit already alarmed
+	CumHistory  []float64  `json:"cum_history,omitempty"`
+	Hist        []blockRec `json:"hist,omitempty"`
+	UpdatedAt   time.Time  `json:"updated_at"`
 }
 
 func saveState(path string, s *huntState) {
@@ -176,26 +180,39 @@ func mergeReplace(mids []float64, a, b float64, repl []float64) []float64 {
 func probeCandidates(bg *blockGrid, cands []float64, h, t0, t1 float64, mids []float64, workers int) ([]float64, int64, int) {
 	ulp := math.Nextafter(t1, math.Inf(1)) - t1
 	fine := math.Max(ulp, h/64)
-	// Cell semantics make insertion unambiguous: the dip predicate
-	// guarantees the cells flanking the candidate sample contain no
-	// known crossing, and the hidden pair must lie in exactly those
-	// cells (the candidate is the |Z| minimum sample of its dip). So
-	// zeros found inside the core zone (c-1.4h, c+1.4h) are new by
-	// construction; no distance matching against old estimates needed.
+	// Cell semantics make insertion unambiguous: expand the acceptance
+	// zone outward from the candidate cell by cell while the cells hold
+	// no known crossing (capped at +-3 cells). A hidden pair lies in
+	// crossing-free cells near the dip minimum, possibly skewed one
+	// cell sideways, and the zone contains no known zero by
+	// construction, so every probe crossing inside it is new. Fixed
+	// zones lost pair members on skewed dips (odd recovery counts in
+	// production logs).
 	var evals int64
 	recovered := 0
-	lastC := math.Inf(-1)
+	probedUpTo := math.Inf(-1)
 	for _, c := range cands {
-		if c-lastC < 8*h {
-			continue // region already probed by the previous candidate
+		if c <= probedUpTo {
+			continue // inside an already-probed zone
 		}
-		lastC = c
-		zLo, zHi := math.Max(c-1.4*h, t0), math.Min(c+1.4*h, t1)
+		cellFree := func(x float64) bool {
+			i := sort.SearchFloat64s(mids, x)
+			return i >= len(mids) || mids[i] > x+h
+		}
+		zLo, zHi := c-h, c+h
+		for k := 0; k < 2 && zLo-h >= t0 && cellFree(zLo-h); k++ {
+			zLo -= h
+		}
+		for k := 0; k < 2 && zHi+h <= t1 && cellFree(zHi); k++ {
+			zHi += h
+		}
+		zLo, zHi = math.Max(zLo, t0), math.Min(zHi, t1)
 		iLo := sort.SearchFloat64s(mids, zLo)
 		iHi := sort.SearchFloat64s(mids, zHi)
 		if iHi > iLo {
-			continue // core zone unexpectedly holds a known zero; leave to fallback
+			continue // zone unexpectedly holds a known zero; leave to fallback
 		}
+		probedUpTo = zHi
 		tryMerge := func(nm []float64) int {
 			added := 0
 			for _, z := range nm {
@@ -214,14 +231,14 @@ func probeCandidates(bg *blockGrid, cands []float64, h, t0, t1 float64, mids []f
 			return added
 		}
 		if fine < h {
-			nm, e := bg.scanZ(c-3*h, c+3*h, fine, workers)
+			nm, e := bg.scanZ(zLo-h, zHi+h, fine, workers)
 			evals += e
 			if a := tryMerge(nm); a > 0 {
 				recovered += a
 				continue
 			}
 		}
-		nm, e := scanBlock(c-3*h, c+3*h, 4096, workers)
+		nm, e := scanBlock(zLo-h, zHi+h, 4096, workers)
 		evals += e
 		recovered += tryMerge(nm)
 	}
@@ -469,13 +486,36 @@ func runHunt(args []string) {
 			}
 		}
 
-		// Fallback sweep: only when the count is still short of a pair
-		// after probing (a dip outside the collection threshold, e.g. in
-		// a locally loud stretch of Z). Rare by design.
+		// Turing certification: pin the ABSOLUTE zero count at an anchor
+		// near the block end. Between consecutive certified anchors the
+		// found count must match the certified difference exactly; a
+		// discrepancy is a proven integer number of missing zeros, not a
+		// statistical hint, and forces the heavy recovery passes.
 		hMin := math.Nextafter(t1, math.Inf(1)) - t1
-		if drift := float64(len(mids)) - expected; drift <= -1.5 && hBase/8 >= hMin {
+		anchorT := t1 - turingL
+		certDeficit := int64(0)
+		checkAnchor := func() {
+			certDeficit = 0
+			aN, res, ok := turingAnchor(anchorT, mids)
+			if !ok {
+				logf("turing anchor at %.3f failed (residual %+.2f); retrying next block", anchorT, res)
+				return
+			}
+			foundAt := st.ZerosFound + int64(sort.SearchFloat64s(mids, anchorT))
+			if st.AnchorN != 0 {
+				certDeficit = (aN - st.AnchorN) - (foundAt - st.AnchorFound)
+			}
+			if certDeficit == 0 {
+				st.AnchorT, st.AnchorN, st.AnchorFound = anchorT, aN, foundAt
+			}
+		}
+		checkAnchor()
+
+		// Fallback sweep: when probing left the count short of a pair OR
+		// the Turing ledger proves zeros are missing.
+		if drift := float64(len(mids)) - expected; (drift <= -1.5 || certDeficit > 0) && hBase/8 >= hMin {
 			rescans++
-			logf("rescan block=%d pass=8x full drift=%+.3f", st.Blocks+1, drift)
+			logf("rescan block=%d pass=8x full drift=%+.3f certified_deficit=%d", st.Blocks+1, drift, certDeficit)
 			prev := mids
 			nm, e2 := bg.scanZ(t0, t1, hBase/8, *workers)
 			evals += e2
@@ -490,7 +530,7 @@ func runHunt(args []string) {
 		}
 		// Deep rung: pairs below the lattice floor leave a dip fingerprint
 		// at one-ulp sampling that nothing can mask.
-		if drift := float64(len(mids)) - expected; drift <= -1.5 {
+		if drift := float64(len(mids)) - expected; drift <= -1.5 || certDeficit > 0 {
 			logf("rescan block=%d pass=diphunt drift=%+.3f", st.Blocks+1, drift)
 			prev := mids
 			var e2 int64
@@ -505,6 +545,19 @@ func runHunt(args []string) {
 				logf("rescan block=%d diphunt recovered %d zeros", st.Blocks+1, rec)
 			}
 		}
+		if certDeficit != 0 {
+			checkAnchor() // re-certify after recovery passes
+			if certDeficit != st.CertAck {
+				if certDeficit > 0 {
+					alogf("TURING DEFICIT block=%d: %d zero(s) PROVEN missing in (%.3f, %.3f) and not recoverable on the line. This is certified counting, not statistics. Investigate immediately with ./riemann check and independent tools.",
+						st.Blocks+1, certDeficit, st.AnchorT, anchorT)
+				} else if certDeficit < 0 {
+					alogf("TURING SURPLUS block=%d: %d more crossings than zeros exist in (%.3f, %.3f); phantom crossings indicate an evaluation bug",
+						st.Blocks+1, -certDeficit, st.AnchorT, anchorT)
+				}
+			}
+		}
+		st.CertAck = certDeficit
 		dur := time.Since(blockStart)
 
 		st.ZerosFound += int64(len(mids))

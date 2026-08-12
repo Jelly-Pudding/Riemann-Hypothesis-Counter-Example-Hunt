@@ -77,8 +77,11 @@ Then as root: `systemctl restart zeta`
 ## Normal Operation
 
 - One block line roughly every 10 seconds. Each block is 1 million height units which is about 4.28 million zeros.
-- drift and dev stay between −1.5 and +1.5. That is ordinary statistical wobble.
-- rescan lines on most blocks. The base scan straddles a few very close zero pairs per block. The rescan passes find where they hide and recover them. The drift on a rescan line is measured before recovery.
+- drift stays between −1.5 and +1.5 and dev stays between −2.5 and +2.5. That is ordinary statistical wobble.
+- "dip probes" lines on most blocks. A few zero pairs per block sit closer together than the scan grid. Each one leaves a fingerprint where Z dips near zero without crossing. The base scan spots these as it goes and tiny probes confirm the pair and add it to the count.
+- Every block ends with a silent Turing certification. It proves the exact total number of zeros below the block end using Turing's method. The count of zeros found must match that proven total exactly.
+- rescan, diphunt and backscan lines are rare fallbacks. A rescan with certified_deficit means the proven total showed a zero was missed and heavier passes went and found it. Fine in moderation.
+- A "turing anchor failed" line means certification could not lock on for one block and will retry next block. Rare and fine.
 - A SUMMARY line every 15 minutes with totals and pace.
 - hunt.anomalies.log stays empty.
 
@@ -88,4 +91,6 @@ hunt.state.json holds the height reached and total zeros.
 
 ## Jackpot Signal:
 
-- An ANOMALY line means a deficit of about 2 zeros survived every rescan. Investigate with `./riemann check <t0> <t1>` over the region in the line. It escalates density until the count settles. If the deficit survives that then verify with independent tools.
+- A TURING DEFICIT line in hunt.anomalies.log is the real signal. It means zeros are PROVEN missing from the critical line by certified integer counting after every recovery pass failed to find them. Not statistics. Investigate with `./riemann check <t0> <t1>` over the region in the line then verify with independent tools.
+- An ANOMALY line is the older statistical signal and still worth checking the same way.
+- A TURING SURPLUS line would mean more crossings counted than zeros exist. That is a bug in the program not a discovery.
