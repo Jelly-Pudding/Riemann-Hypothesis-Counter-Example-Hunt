@@ -16,7 +16,12 @@ import (
 
 const (
 	interpSigma = 2.5 // oversampling vs complex Nyquist
-	interpL     = 20  // kernel taps per side
+	interpL     = 20  // kernel taps per side (error ~6e-9)
+	// Fast kernel for the base pass: 12 taps per side, error ~1.2e-5.
+	// The base scan's decisions live far above that (dip threshold
+	// 2000h^2 ~ 3e-2, crossing slopes O(1) per unit); every rescan,
+	// probe and dipHunt keeps the full kernel.
+	interpF = 12
 )
 
 type sInterp struct {
@@ -29,6 +34,8 @@ type sInterp struct {
 	B    []complex128 // demodulated samples: B[j] = S(t_j) e^{+i j hi wc}
 	a2   float64      // Gaussian taper width^2
 	e3   [interpL + 1]float64
+	a2f  float64 // fast-kernel taper width^2
+	e3f  [interpF + 1]float64
 }
 
 func buildSInterp(segA, segB float64, m, workers int) (*sInterp, int64) {
@@ -75,6 +82,10 @@ func (si *sInterp) initKernel() {
 	for l := 0; l <= interpL; l++ {
 		si.e3[l] = math.Exp(-float64(l*l) / si.a2)
 	}
+	si.a2f = 2 * float64(interpF) / (math.Pi * (1 - 1/interpSigma))
+	for l := 0; l <= interpF; l++ {
+		si.e3f[l] = math.Exp(-float64(l*l) / si.a2f)
+	}
 }
 
 // evalB reconstructs the demodulated (baseband) sum at fractional
@@ -107,6 +118,38 @@ func (si *sInterp) evalB(u float64) complex128 {
 	for l := 1; l <= interpL; l++ {
 		q *= e2
 		acc += si.B[j0+l] * complex(sign*q*si.e3[l]/(f-float64(l)), 0)
+		sign = -sign
+	}
+	return acc
+}
+
+// evalBF is evalB with the truncated fast kernel (interpF taps per side,
+// error ~1.2e-5). Same structure, narrower taper.
+func (si *sInterp) evalBF(u float64) complex128 {
+	j0 := int(u)
+	f := u - float64(j0)
+	if f < 1e-9 {
+		return si.B[j0]
+	}
+	if f > 1-1e-9 {
+		return si.B[j0+1]
+	}
+	s0 := math.Sin(math.Pi*f) / math.Pi
+	e1 := math.Exp(-f * f / si.a2f)
+	e2 := math.Exp(2 * f / si.a2f)
+	p := e1 * s0
+	var acc complex128
+	q, sign := p, 1.0
+	e2inv := 1 / e2
+	for k := 0; k < interpF; k++ {
+		acc += si.B[j0-k] * complex(sign*q*si.e3f[k]/(f+float64(k)), 0)
+		q *= e2inv
+		sign = -sign
+	}
+	q, sign = p, -1.0
+	for l := 1; l <= interpF; l++ {
+		q *= e2
+		acc += si.B[j0+l] * complex(sign*q*si.e3f[l]/(f-float64(l)), 0)
 		sign = -sign
 	}
 	return acc
@@ -174,14 +217,21 @@ func (bg *blockGrid) scanZ(a, b, h float64, workers int) ([]float64, int64) {
 // locates pair hiding spots at zero extra evaluation cost. Callers
 // confirm each candidate with a cheap probe.
 func (bg *blockGrid) scan(a, b, h float64, workers int, dips bool) ([]float64, []float64, int64) {
-	if h < math.Nextafter(b, math.Inf(1))-b {
-		// Below one ulp of t consecutive lattice points collapse onto the
-		// same float64 while theta keeps advancing, producing phantom
-		// crossings. Callers must use the direct dd-grid engine instead.
-		panic(fmt.Sprintf("scanZ: lattice spacing %g is below ulp(%g); use the direct engine", h, b))
+	// The lattice may sit far below one ulp of t: alignment arithmetic is
+	// exact at any spacing (dividing by a dyadic h never rounds, and when
+	// a/h >= 2^52 it is exactly an integer, so a0 == a), and evaluation
+	// runs in index space where neither the phase nor the interpolation
+	// coordinate ever quantizes. Sub-ulp lattice points are not distinct
+	// float64s but their Z values are genuine band-limited reconstructions
+	// at the true real-number positions.
+	if h < math.Ldexp(1, -40) {
+		panic(fmt.Sprintf("scanZ: lattice spacing %g is absurdly fine", h))
 	}
 	dipThresh := math.Min(2e-2, math.Max(1e-6, 2000*h*h))
 	a0 := math.Ceil(a/h) * h
+	if (b-a0)/h > float64(int64(1)<<40) {
+		panic(fmt.Sprintf("scanZ: %g lattice points over [%g,%g] (runaway density)", (b-a0)/h, a, b))
+	}
 	count := int(math.Floor((b-a0)/h)) + 1
 	if count < 2 {
 		return nil, nil, 0
@@ -197,7 +247,13 @@ func (bg *blockGrid) scan(a, b, h float64, workers int, dips bool) ([]float64, [
 	zs := make([]float64, min(total, chunk))
 	for cs := 0; cs < total; cs += chunk {
 		ce := min(total, cs+chunk)
-		bg.evalRange(a0-h, h, cs, ce, workers, zs)
+		// Anchor at a0 (exactly representable) with index offset -1, so
+		// point gj sits at a0 + (gj-1)*h in exact index arithmetic; the
+		// old anchor a0-h is not representable when h is below one ulp.
+		// The base pass (dips) takes the fast kernel: its thresholds sit
+		// orders of magnitude above the fast kernel's error, and every
+		// deficit path rescans with the full kernel anyway.
+		bg.evalRange(a0, h, cs-1, ce-1, workers, zs, dips)
 		lo := 0
 		if cs == 0 {
 			prev = zs[0]
@@ -207,7 +263,7 @@ func (bg *blockGrid) scan(a, b, h float64, workers int, dips bool) ([]float64, [
 			cur := zs[j]
 			gj := cs + j
 			if (prev < 0) != (cur < 0) && (includeSeed || gj > 1) {
-				m := a0 - h + (float64(gj)-0.5)*h
+				m := a0 + (float64(gj)-1.5)*h
 				if m < a {
 					// Seed-interval crossings belong to (a, a0]; clamp the
 					// estimate so callers' [a, b] bookkeeping stays exact.
@@ -218,7 +274,7 @@ func (bg *blockGrid) scan(a, b, h float64, workers int, dips bool) ([]float64, [
 			if dips && gj >= 2 && math.Abs(prev) < dipThresh &&
 				math.Abs(prev) <= math.Abs(p2) && math.Abs(prev) <= math.Abs(cur) &&
 				(p2 < 0) == (cur < 0) && (p2 < 0) == (prev < 0) && len(cands) < 8192 {
-				c := a0 - h + float64(gj-1)*h
+				c := a0 + float64(gj-2)*h
 				if c > a && c < b {
 					cands = append(cands, c)
 				}
@@ -231,8 +287,9 @@ func (bg *blockGrid) scan(a, b, h float64, workers int, dips bool) ([]float64, [
 
 // evalRange fills zs[0:ce-cs] with Z at lattice points base + j*h for
 // j in [cs, ce), using the windowed quadratic theta expansion (with the
-// interpolation demodulation folded into the linear term).
-func (bg *blockGrid) evalRange(base, h float64, cs, ce, workers int, zs []float64) {
+// interpolation demodulation folded into the linear term). fast selects
+// the truncated reconstruction kernel (~1.2e-5 vs ~6e-9).
+func (bg *blockGrid) evalRange(base, h float64, cs, ce, workers int, zs []float64, fast bool) {
 	parallelRange(ce-cs, workers, func(lo, hi int) {
 		si := bg.segs[0]
 		winStart, winEnd := -1, -1
@@ -240,6 +297,7 @@ func (bg *blockGrid) evalRange(base, h float64, cs, ce, workers int, zs []float6
 		var Bq float64
 		var q0, q1, q2 float64
 		var kc int
+		var uA, du float64
 		for j := lo; j < hi; j++ {
 			t := base + float64(cs+j)*h
 			if t >= si.segB && si != bg.segs[len(bg.segs)-1] {
@@ -258,8 +316,12 @@ func (bg *blockGrid) evalRange(base, h float64, cs, ce, workers int, zs []float6
 				winEnd = winStart + w
 				kc = winStart + w/2
 				tc := ddAddD(twoProd(h, float64(kc)), base)
-				// theta' minus the demodulation slope wc, per lattice step
-				thC = ddSub(thetaDDt(tc), dd{math.Mod((tc.hi-si.tA)*si.wc, 2*math.Pi), 0})
+				// theta' minus the demodulation slope wc, per lattice step.
+				// The demodulation anchor must use the full dd window center:
+				// dropping tc.lo puts a constant phase error of up to
+				// wc*2^-12 on the whole window, which jitters zero midpoints
+				// by about a lattice cell between window anchorings.
+				thC = ddAddD(thetaDDt(tc), -ddMod2Pi(ddMulD(ddAddD(tc, -si.tA), si.wc)))
 				A = ddAddD(ddMulD(ddSub(lnDDdd(tc), ddLn2Pi), h/2), -h*si.wc)
 				Bq = h * h / (4 * tc.hi)
 				x1 := float64(winStart - kc)
@@ -270,12 +332,25 @@ func (bg *blockGrid) evalRange(base, h float64, cs, ce, workers int, zs []float6
 				q2 = ((r0-rc)/x1 - (r2-rc)/x2) / (x1 - x2)
 				q1 = (r0-rc)/x1 - q2*x1
 				q0 = rc
+				// Interpolation coordinate in index space: u = uA + j*du.
+				// base - si.tA is exact (Sterbenz: anchors within a factor
+				// of two), so u keeps advancing smoothly even when h is
+				// below one ulp of t and float64 t itself quantizes. The
+				// phase above is index-exact already; with u index-exact
+				// too, sub-ulp lattices produce no phantom crossings.
+				uA = (base - si.tA) / si.hi
+				du = h / si.hi
 			}
 			k := float64(cs + j - kc)
 			ph := ddMod2Pi(ddAddD(ddAdd(thC, ddMulD(A, k)), Bq*k*k))
 			wi, wr := math.Sincos(ph)
-			u := (t - si.tA) / si.hi
-			S := si.evalB(u)
+			u := uA + float64(cs+j)*du
+			var S complex128
+			if fast {
+				S = si.evalBF(u)
+			} else {
+				S = si.evalB(u)
+			}
 			zs[j] = 2*(wr*real(S)-wi*imag(S)) + (q0 + k*(q1+k*q2))
 		}
 	})

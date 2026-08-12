@@ -178,8 +178,7 @@ func mergeReplace(mids []float64, a, b float64, repl []float64) []float64 {
 // crossings are merged; each probe touches only ~7 lattice steps of
 // territory, so boundary attribution stays local and exact.
 func probeCandidates(bg *blockGrid, cands []float64, h, t0, t1 float64, mids []float64, workers int) ([]float64, int64, int) {
-	ulp := math.Nextafter(t1, math.Inf(1)) - t1
-	fine := math.Max(ulp, h/64)
+	fine := h / 64 // u-space lattice: constant relative resolution, no ulp floor
 	// Cell semantics make insertion unambiguous: expand the acceptance
 	// zone outward from the candidate cell by cell while the cells hold
 	// no known crossing (capped at +-3 cells). A hidden pair lies in
@@ -254,7 +253,11 @@ func probeCandidates(bg *blockGrid, cands []float64, h, t0, t1 float64, mids []f
 // Empirically validated on production leaks: block at 3002139e6 held a
 // pair with gap of exactly one ulp, found as the sole dip candidate.
 func dipHunt(bg *blockGrid, t0, t1 float64, mids []float64, workers int) ([]float64, int64, int) {
-	h := math.Nextafter(t1, math.Inf(1)) - t1 // one ulp: finest legal lattice
+	// Budget lattice: ~2^31 points regardless of height. For 1e6-unit
+	// blocks this is 2^-11, the one-ulp spacing of the 3e12 era, and the
+	// u-space evaluator keeps it there as t grows instead of coarsening
+	// with the float64 ulp.
+	h := math.Ldexp(1, int(math.Ceil(math.Log2((t1-t0)/float64(int64(1)<<31)))))
 	a0 := math.Ceil(t0/h) * h
 	count := int(math.Floor((t1-a0)/h)) + 1
 	if count < 3 {
@@ -269,7 +272,7 @@ func dipHunt(bg *blockGrid, t0, t1 float64, mids []float64, workers int) ([]floa
 	var p1, p2 float64
 	for cs := 0; cs < count; cs += chunk {
 		ce := min(count, cs+chunk)
-		bg.evalRange(a0, h, cs, ce, workers, zs)
+		bg.evalRange(a0, h, cs, ce, workers, zs, false)
 		for j := 0; j < ce-cs; j++ {
 			z := zs[j]
 			gj := cs + j
@@ -361,12 +364,13 @@ func runHunt(args []string) {
 		os.Exit(2)
 	}
 	fs.Parse(args[1:])
-	if start > 1e14 || *end > 1e14 {
-		// Above t ~ 1e14 the float64 ULP (>= 0.0156) approaches the scan
-		// step (~0.05), so grid points quantize together and the density
-		// guarantee silently erodes. Refuse rather than mis-scan; going
-		// higher needs the grid itself carried in double-double.
-		fmt.Fprintln(os.Stderr, "heights above 1e14 are not supported yet: the float64 scan grid loses resolution there")
+	if start > 3e13 || *end > 3e13 {
+		// The scan lattice runs in index space with no ulp floor, but
+		// zero positions and probe cells are still plain float64: above
+		// t ~ 3e13 one ulp (2^-7) passes the base cell size and probe
+		// bookkeeping loses resolution. Refuse rather than mis-scan;
+		// going higher needs offset-space bookkeeping too.
+		fmt.Fprintln(os.Stderr, "heights above 3e13 are not supported yet: float64 zero bookkeeping loses resolution there")
 		os.Exit(2)
 	}
 
@@ -491,7 +495,6 @@ func runHunt(args []string) {
 		// found count must match the certified difference exactly; a
 		// discrepancy is a proven integer number of missing zeros, not a
 		// statistical hint, and forces the heavy recovery passes.
-		hMin := math.Nextafter(t1, math.Inf(1)) - t1
 		anchorT := t1 - turingL
 		certDeficit := int64(0)
 		checkAnchor := func() {
@@ -513,7 +516,7 @@ func runHunt(args []string) {
 
 		// Fallback sweep: when probing left the count short of a pair OR
 		// the Turing ledger proves zeros are missing.
-		if drift := float64(len(mids)) - expected; (drift <= -1.5 || certDeficit > 0) && hBase/8 >= hMin {
+		if drift := float64(len(mids)) - expected; drift <= -1.5 || certDeficit > 0 {
 			rescans++
 			logf("rescan block=%d pass=8x full drift=%+.3f certified_deficit=%d", st.Blocks+1, drift, certDeficit)
 			prev := mids
@@ -616,7 +619,6 @@ func runHunt(args []string) {
 			for i := origin; i < len(hist) && dev <= devTrip; i++ {
 				b := &hist[i]
 				bExpected := nDiff(b.T0, b.T1)
-				hMinB := math.Nextafter(b.T1, math.Inf(1)) - b.T1
 				var last []float64
 				accept := func(m2 []float64, densLabel string) {
 					diff := float64(len(m2)) - bExpected
@@ -651,7 +653,7 @@ func runHunt(args []string) {
 				// Build the interpolation grid once for both density passes.
 				var bgb *blockGrid
 				for _, m := range []int{2, 8} {
-					if m <= b.Mult || b.HBase/float64(m) < hMinB {
+					if m <= b.Mult {
 						continue
 					}
 					logf("backscan t=[%.3f,%.3f] pass=%dx dev=%+.3f", b.T0, b.T1, m, dev)
@@ -672,7 +674,7 @@ func runHunt(args []string) {
 				}
 				// Blocks whose densities were already tried skip the loop
 				// above; rebuild their zero list so the dip rung can run.
-				if dev <= devTrip && last == nil && b.HBase/8 >= hMinB {
+				if dev <= devTrip && last == nil {
 					logf("backscan t=[%.3f,%.3f] pass=8x-relist dev=%+.3f", b.T0, b.T1, dev)
 					bs := time.Now()
 					if bgb == nil {
@@ -748,8 +750,8 @@ func runHunt(args []string) {
 
 		if *summarySec > 0 && time.Since(lastSum).Seconds() >= *summarySec {
 			el := time.Since(lastSum).Seconds()
-			logf("SUMMARY height=%.0f zeros=%d rate=%.0f zeros/s pace=%.3g units/day dev=%+.3f anomalies=%d",
-				st.NextT, st.ZerosFound, float64(st.ZerosFound-sumZ0)/el,
+			logf("SUMMARY height=%.0f zeros=%d certified_N=%d rate=%.0f zeros/s pace=%.3g units/day dev=%+.3f anomalies=%d",
+				st.NextT, st.ZerosFound, st.AnchorN, float64(st.ZerosFound-sumZ0)/el,
 				(st.NextT-sumT0)/el*86400, dev, st.Anomalies)
 			lastSum = time.Now()
 			sumT0, sumZ0 = st.NextT, st.ZerosFound

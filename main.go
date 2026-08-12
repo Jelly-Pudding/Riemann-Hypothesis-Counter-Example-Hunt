@@ -88,22 +88,24 @@ func main() {
 			// until the count settles.
 			spacing := 2 * math.Pi / math.Log(((t0+t1)/2)/(2*math.Pi))
 			h := math.Ldexp(1, int(math.Round(math.Log2(spacing/64))))
-			hMin := math.Nextafter(t1, math.Inf(1)) - t1
 			bg, _ := buildBlockGrid(t0, t1, runtime.NumCPU())
 			for _, mult := range []float64{1, 8, 64, 512} {
-				kind := "interp"
-				if h/mult < hMin {
-					// The lattice cannot go below one ulp of t; switch to
-					// the direct dd-grid engine.
-					kind = "direct"
-					zs, _ = scanBlockChunked(t0, t1, h/mult, runtime.NumCPU())
-				} else {
-					zs, _ = bg.scanZ(t0, t1, h/mult, runtime.NumCPU())
-				}
-				fmt.Printf("  density %4.0fx base (%s): %d sign changes (expected %.3f)\n",
-					mult, kind, len(zs), expected)
+				// The u-space lattice has no ulp floor: every rung runs on
+				// the interpolation engine at exact index arithmetic.
+				zs, _ = bg.scanZ(t0, t1, h/mult, runtime.NumCPU())
+				fmt.Printf("  density %4.0fx base (interp): %d sign changes (expected %.3f)\n",
+					mult, len(zs), expected)
 				if float64(len(zs))-expected > -1.5 {
 					break
+				}
+			}
+			if float64(len(zs))-expected <= -1.5 && t1-t0 <= 2000 {
+				// Independent confirmation: the direct dd-grid engine
+				// shares no code path with the interpolation above.
+				zs2, _ := scanBlockChunked(t0, t1, h/64, runtime.NumCPU())
+				fmt.Printf("  direct dd-grid at 64x: %d sign changes\n", len(zs2))
+				if len(zs2) > len(zs) {
+					zs = zs2
 				}
 			}
 		} else {

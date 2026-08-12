@@ -82,7 +82,7 @@ Then as root: `systemctl restart zeta`
 - Every block ends with a silent Turing certification. It proves the exact total number of zeros below the block end using Turing's method. The count of zeros found must match that proven total exactly.
 - rescan, diphunt and backscan lines are rare fallbacks. A rescan with certified_deficit means the proven total showed a zero was missed and heavier passes went and found it. Fine in moderation.
 - A "turing anchor failed" line means certification could not lock on for one block and will retry next block. Rare and fine.
-- A SUMMARY line every 15 minutes with totals and pace.
+- A SUMMARY line every 15 minutes with totals and pace. certified_N is the proven total number of zeros below the last certified anchor.
 - hunt.anomalies.log stays empty.
 
 ## Progress Checkpoints
