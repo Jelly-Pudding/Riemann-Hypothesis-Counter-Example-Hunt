@@ -43,6 +43,22 @@ func TestSubUlpMatchesUlpLattice(t *testing.T) {
 	}
 }
 
+// scanFull (the heavy-pass list builder) must produce complete lists:
+// on the tight-pair-rich storm block its 8x dip-first pass must land on
+// the independently established truth exactly, proving replacement
+// lists never lose probe-recovered pairs.
+func TestScanFullStormBlock(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+	a, b := 3001575e6, 3001576e6
+	bg, _ := buildBlockGrid(a, b, 16)
+	mids, _ := scanFull(bg, a, b, math.Ldexp(1, -11), 16)
+	if len(mids) != 4280041 {
+		t.Fatalf("scanFull found %d zeros in the storm block, truth is 4280041", len(mids))
+	}
+}
+
 // The fast base-pass kernel must stay within its ~1.2e-5 error budget
 // of the full kernel and find the identical crossing set.
 func TestFastKernelMatchesFull(t *testing.T) {

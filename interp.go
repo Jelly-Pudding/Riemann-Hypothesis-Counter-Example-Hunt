@@ -199,7 +199,7 @@ func (bg *blockGrid) segFor(t float64) *sInterp {
 // lattice and no interval is scanned twice or missed). Returns the
 // sign-change midpoints and the number of evaluations.
 func (bg *blockGrid) scanZ(a, b, h float64, workers int) ([]float64, int64) {
-	mids, _, evals := bg.scan(a, b, h, workers, false)
+	mids, _, evals := bg.scan(a, b, h, workers, false, false)
 	return mids, evals
 }
 
@@ -208,8 +208,11 @@ func (bg *blockGrid) scanZ(a, b, h float64, workers int) ([]float64, int64) {
 // between lattice points always leaves such a dip (flanking samples
 // read |Z| of order |Z”|h^2), so collecting dips during the base pass
 // locates pair hiding spots at zero extra evaluation cost. Callers
-// confirm each candidate with a cheap probe.
-func (bg *blockGrid) scan(a, b, h float64, workers int, dips bool) ([]float64, []float64, int64) {
+// confirm each candidate with a cheap probe. fast selects the truncated
+// reconstruction kernel; dense rescans keep the full kernel because
+// their dip signals scale with h^2 and sit closer to the fast kernel's
+// error floor.
+func (bg *blockGrid) scan(a, b, h float64, workers int, dips, fast bool) ([]float64, []float64, int64) {
 	// The lattice may sit far below one ulp of t: alignment arithmetic is
 	// exact at any spacing (dividing by a dyadic h never rounds, and when
 	// a/h >= 2^52 it is exactly an integer, so a0 == a), and evaluation
@@ -243,10 +246,7 @@ func (bg *blockGrid) scan(a, b, h float64, workers int, dips bool) ([]float64, [
 		// Anchor at a0 (exactly representable) with index offset -1, so
 		// point gj sits at a0 + (gj-1)*h in exact index arithmetic; the
 		// old anchor a0-h is not representable when h is below one ulp.
-		// The base pass (dips) takes the fast kernel: its thresholds sit
-		// orders of magnitude above the fast kernel's error, and every
-		// deficit path rescans with the full kernel anyway.
-		bg.evalRange(a0, h, cs-1, ce-1, workers, zs, dips)
+		bg.evalRange(a0, h, cs-1, ce-1, workers, zs, fast)
 		lo := 0
 		if cs == 0 {
 			prev = zs[0]

@@ -14,6 +14,6 @@ func BenchmarkBasePass(b *testing.B) {
 	h := math.Ldexp(1, -8)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		bg.scan(a, e, h, 16, true)
+		bg.scan(a, e, h, 16, true, true)
 	}
 }

@@ -296,6 +296,25 @@ func dipHunt(bg *blockGrid, t0, t1 float64, mids []float64, workers int) ([]floa
 	return mids, evals, recovered
 }
 
+// scanFull builds a complete zero list for [t0, t1] at spacing h with
+// the same dip-first machinery as the base pass: scan collecting dip
+// fingerprints, then probe and merge each candidate. A list built this
+// way is strictly more complete than any coarser list, so heavy passes
+// can replace wholesale without discarding probe-recovered sub-lattice
+// pairs (a plain relist cannot see them, which produced spurious
+// REJECTED lines and transient count dips in production). Full-accuracy
+// kernel: dip signals at rescan densities scale with h^2 and sit too
+// close to the fast kernel's error floor.
+func scanFull(bg *blockGrid, t0, t1, h float64, workers int) ([]float64, int64) {
+	nm, cands, e := bg.scan(t0, t1, h, workers, true, false)
+	if len(cands) > 0 {
+		var e2 int64
+		nm, e2, _ = probeCandidates(bg, cands, h, t0, t1, nm, workers)
+		e += e2
+	}
+	return nm, e
+}
+
 // scanBlockChunked runs the direct (non-interpolated) NUFFT scanner over
 // [a, b] at step ~h, in sub-ranges bounded to ~8M points to cap memory.
 // The direct engine's double-double grid is exact at any step size, so
@@ -352,6 +371,7 @@ func runHunt(args []string) {
 	anomPath := fs.String("anomalylog", "hunt.anomalies.log", "log file for anomalies only")
 	zerosPath := fs.String("zeroslog", "", "optional file to append zero locations to")
 	summarySec := fs.Float64("summary", 900, "seconds between SUMMARY progress lines (0 = off)")
+	logEvery := fs.Int64("logevery", 10, "log every Nth routine block (eventful blocks always log; 1 = every block)")
 
 	if len(args) < 1 {
 		fmt.Fprintln(os.Stderr, "usage: riemann hunt <start-height> [flags]")
@@ -448,6 +468,7 @@ func runHunt(args []string) {
 	hist := st.Hist        // survives restarts via the state file
 	lastSum := time.Now()
 	sumT0, sumZ0 := st.NextT, st.ZerosFound
+	sessionFirst := st.Blocks + 1 // first block of this session always logs
 
 	for *end == 0 || st.NextT < *end {
 		t0 := st.NextT
@@ -469,24 +490,26 @@ func runHunt(args []string) {
 		// flanking it, so pair recovery is a handful of tiny probes
 		// instead of block-wide rescans at higher density.
 		bg, evals := buildBlockGrid(t0, t1, *workers)
-		mids, cands, e := bg.scan(t0, t1, hBase, *workers, true)
+		mids, cands, e := bg.scan(t0, t1, hBase, *workers, true, true)
 		evals += e
 		expected := nDiff(t0, t1)
 
 		rescans, mult := 0, 1
+		eventful := false // heavy passes or rejections force this block's log line
+		probeRec := 0
 		if len(cands) > 0 {
 			prev := mids
 			var e2 int64
-			var rec int
-			mids, e2, rec = probeCandidates(bg, cands, hBase, t0, t1, mids, *workers)
+			mids, e2, probeRec = probeCandidates(bg, cands, hBase, t0, t1, mids, *workers)
 			evals += e2
 			if d := len(mids) - len(prev); d < -2 || d > 64 {
 				alogf("REJECTED dip probes block=%d: count moved by %+d (implausible); keeping previous list",
 					st.Blocks+1, d)
 				mids = prev
-			} else if rec > 0 {
+				probeRec = 0
+				eventful = true
+			} else if probeRec > 0 {
 				rescans++
-				logf("block=%d dip probes: %d candidates, recovered %d zeros", st.Blocks+1, len(cands), rec)
 			}
 		}
 
@@ -518,9 +541,10 @@ func runHunt(args []string) {
 		// the Turing ledger proves zeros are missing.
 		if drift := float64(len(mids)) - expected; drift <= -1.5 || certDeficit > 0 {
 			rescans++
+			eventful = true
 			logf("rescan block=%d pass=8x full drift=%+.3f certified_deficit=%d", st.Blocks+1, drift, certDeficit)
 			prev := mids
-			nm, e2 := bg.scanZ(t0, t1, hBase/8, *workers)
+			nm, e2 := scanFull(bg, t0, t1, hBase/8, *workers)
 			evals += e2
 			mids = mergeReplace(mids, t0, t1, nm)
 			if d := len(mids) - len(prev); d < -2 || d > 64 {
@@ -534,6 +558,7 @@ func runHunt(args []string) {
 		// Deep rung: pairs below the lattice floor leave a dip fingerprint
 		// at one-ulp sampling that nothing can mask.
 		if drift := float64(len(mids)) - expected; drift <= -1.5 || certDeficit > 0 {
+			eventful = true
 			logf("rescan block=%d pass=diphunt drift=%+.3f", st.Blocks+1, drift)
 			prev := mids
 			var e2 int64
@@ -549,6 +574,7 @@ func runHunt(args []string) {
 			}
 		}
 		if certDeficit != 0 {
+			eventful = true
 			checkAnchor() // re-certify after recovery passes
 			if certDeficit != st.CertAck {
 				if certDeficit > 0 {
@@ -583,9 +609,16 @@ func runHunt(args []string) {
 		// warm-up only the per-block checks run.
 		warmedUp := len(st.CumHistory) >= 20
 
-		logf("block=%d t=[%.3f,%.3f] zeros=%d expected=%.3f drift=%+.3f cum_drift=%+.3f dev=%+.3f rescans=%d evals=%d dur=%.2fs rate=%.0f/s total_zeros=%d",
-			st.Blocks, t0, t1, len(mids), expected, float64(len(mids))-expected,
-			cum, dev, rescans, evals, dur.Seconds(), float64(evals)/dur.Seconds(), st.ZerosFound)
+		// Routine blocks log every logEvery-th line; anything eventful
+		// (heavy passes, rejections, certified deficits, big drift, dev
+		// near alarm) always logs, as does the first block of a session.
+		drift := float64(len(mids)) - expected
+		if eventful || math.Abs(drift) >= 1.2 || dev <= devTrip+0.5 ||
+			*logEvery <= 1 || st.Blocks%*logEvery == 0 || st.Blocks == sessionFirst {
+			logf("block=%d t=[%.3f,%.3f] zeros=%d expected=%.3f drift=%+.3f cum_drift=%+.3f dev=%+.3f probes=%d/%d rescans=%d evals=%d dur=%.2fs rate=%.0f/s total_zeros=%d",
+				st.Blocks, t0, t1, len(mids), expected, drift,
+				cum, dev, len(cands), probeRec, rescans, evals, dur.Seconds(), float64(evals)/dur.Seconds(), st.ZerosFound)
+		}
 
 		// Backscan: a step-drop of ~2 in dev means a pair went missing in
 		// a recent block, not necessarily this one. A fruitless walk
@@ -663,7 +696,7 @@ func runHunt(args []string) {
 						bgb, e1 = buildBlockGrid(b.T0, b.T1, *workers)
 						st.Evals += e1
 					}
-					m2, e2 := bgb.scanZ(b.T0, b.T1, b.HBase/float64(m), *workers)
+					m2, e2 := scanFull(bgb, b.T0, b.T1, b.HBase/float64(m), *workers)
 					st.Evals += e2
 					st.Seconds += time.Since(bs).Seconds()
 					b.Mult = m
@@ -682,7 +715,7 @@ func runHunt(args []string) {
 						bgb, e1 = buildBlockGrid(b.T0, b.T1, *workers)
 						st.Evals += e1
 					}
-					m2, e2 := bgb.scanZ(b.T0, b.T1, b.HBase/8, *workers)
+					m2, e2 := scanFull(bgb, b.T0, b.T1, b.HBase/8, *workers)
 					st.Evals += e2
 					st.Seconds += time.Since(bs).Seconds()
 					accept(m2, "8x-relist")

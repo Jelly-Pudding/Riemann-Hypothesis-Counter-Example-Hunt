@@ -76,9 +76,10 @@ Then as root: `systemctl restart zeta`
 
 ## Normal Operation
 
-- One block line roughly every 10 seconds. Each block is 1 million height units which is about 4.28 million zeros.
+- One block line roughly every minute. Every block is still scanned and counted but only every 10th writes a log line. Blocks that needed heavy passes or drifted hard always log. Pass -logevery 1 to log every block.
+- Each block is 1 million height units which is about 4.28 million zeros.
 - drift stays between −1.5 and +1.5 and dev stays between −2.5 and +2.5. That is ordinary statistical wobble.
-- "dip probes" lines on most blocks. A few zero pairs per block sit closer together than the scan grid. Each one leaves a fingerprint where Z dips near zero without crossing. The base scan spots these as it goes and tiny probes confirm the pair and add it to the count.
+- probes=c/r on the block line counts dip probes. A few zero pairs per block sit closer together than the scan grid. Each one leaves a fingerprint where Z dips near zero without crossing. The base scan spots these as it goes and tiny probes confirm the pair and add it to the count. c candidates checked and r zeros recovered is normal on most blocks.
 - Every block ends with a silent Turing certification. It proves the exact total number of zeros below the block end using Turing's method. The count of zeros found must match that proven total exactly.
 - rescan, diphunt and backscan lines are rare fallbacks. A rescan with certified_deficit means the proven total showed a zero was missed and heavier passes went and found it. Fine in moderation.
 - A "turing anchor failed" line means certification could not lock on for one block and will retry next block. Rare and fine.
