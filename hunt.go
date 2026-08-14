@@ -560,9 +560,10 @@ func runHunt(args []string) {
 
 		rescans, mult := 0, 1
 		eventful := false // heavy passes or rejections force this block's log line
+		// Deferrals are routine and self-resolving (the probes=c/r field
+		// shows the outcome), so they log without forcing the block line.
 		if n := phantomDrops.Swap(0); n > 0 {
-			eventful = true
-			logf("dropped %d phantom crossing(s) in base scan (full-kernel veto) block=%d", n, st.Blocks+1)
+			logf("deferred %d hairline crossing(s) to dip probes (full-kernel veto) block=%d", n, st.Blocks+1)
 		}
 		probeRec := 0
 		if len(cands) > 0 {

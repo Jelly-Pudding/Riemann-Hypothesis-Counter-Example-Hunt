@@ -297,8 +297,26 @@ func (bg *blockGrid) scan(a, b, h float64, workers int, dips, fast bool) ([]floa
 						}
 					}
 					if !crossed {
+						// No full-kernel crossing anywhere near. Either a
+						// true phantom, or a REAL sub-lattice pair whose dip
+						// stays within the fast kernel's error of zero
+						// (production: ~0.2/block), so the accurate samples
+						// never flip sign at all -- no window can see that.
+						// Both cases belong to the dip probes: drop the
+						// crossing and hand the location over. Probes
+						// resolve sub-lattice pairs exactly on the direct
+						// dd grid and find nothing for genuine phantoms.
 						phantomDrops.Add(1)
 						keep = false
+						if dips && len(cands) < 8192 {
+							c := a0 + float64(gj-2)*h
+							if math.Abs(cur) < math.Abs(prev) {
+								c = a0 + float64(gj-1)*h
+							}
+							if c > a && c < b {
+								cands = append(cands, c)
+							}
+						}
 					}
 				}
 				if keep {
