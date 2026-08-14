@@ -288,9 +288,17 @@ func dipHunt(bg *blockGrid, t0, t1 float64, mids []float64, workers int) ([]floa
 	for _, c := range cands {
 		nm, e := scanBlock(c-4*h, c+4*h, 4096, workers)
 		evals += e
-		if len(nm) >= 2 {
-			mids = mergeReplace(mids, c-4*h, c+4*h, nm)
-			recovered += len(nm)
+		if len(nm) < 2 {
+			continue
+		}
+		// Count the NET gain: the probe window can overlap crossings
+		// already in mids, and the callers' rec>24 plausibility gates and
+		// recovery logs must see genuinely new zeros only. A replacement
+		// that would shrink the list is never taken.
+		merged := mergeReplace(mids, c-4*h, c+4*h, nm)
+		if len(merged) > len(mids) {
+			recovered += len(merged) - len(mids)
+			mids = merged
 		}
 	}
 	return mids, evals, recovered
@@ -547,6 +555,9 @@ func runHunt(args []string) {
 			nm, e2 := scanFull(bg, t0, t1, hBase/8, *workers)
 			evals += e2
 			mids = mergeReplace(mids, t0, t1, nm)
+			// A replacement list 1-2 short (d of -1/-2) is tolerated here:
+			// the Turing re-certification below is the integer-exact
+			// backstop that catches any real loss as a deficit.
 			if d := len(mids) - len(prev); d < -2 || d > 64 {
 				alogf("REJECTED rescan block=%d pass=8x: count moved by %+d (implausible); keeping previous list",
 					st.Blocks+1, d)
@@ -575,15 +586,56 @@ func runHunt(args []string) {
 		}
 		if certDeficit != 0 {
 			eventful = true
-			checkAnchor() // re-certify after recovery passes
-			if certDeficit != st.CertAck {
-				if certDeficit > 0 {
-					alogf("TURING DEFICIT block=%d: %d zero(s) PROVEN missing in (%.3f, %.3f) and not recoverable on the line. This is certified counting, not statistics. Investigate immediately with ./riemann check and independent tools.",
-						st.Blocks+1, certDeficit, st.AnchorT, anchorT)
-				} else if certDeficit < 0 {
-					alogf("TURING SURPLUS block=%d: %d more crossings than zeros exist in (%.3f, %.3f); phantom crossings indicate an evaluation bug",
-						st.Blocks+1, -certDeficit, st.AnchorT, anchorT)
+			checkAnchor() // re-certify after in-block recovery passes
+		}
+		// The certified interval (st.AnchorT, anchorT) can begin in an
+		// EARLIER block: a pair straddled inside a previous block's anchor
+		// window (or lost while a failed anchor was retrying) is invisible
+		// to the in-block passes above, and dev wobble can sit above the
+		// backscan trip forever. Chase the deficit into the blocks it
+		// actually covers before alarming, else an ordinary missed pair
+		// reads as a false jackpot.
+		if certDeficit > 0 && st.AnchorT > 0 && st.AnchorT < t0 {
+			for i := len(hist) - 1; i >= 0 && certDeficit > 0; i-- {
+				b := &hist[i]
+				if b.T1 <= st.AnchorT {
+					break // wholly below the certified interval
 				}
+				logf("rescan below block=%d t=[%.3f,%.3f] certified_deficit=%d", st.Blocks+1, b.T0, b.T1, certDeficit)
+				bgb, e1 := buildBlockGrid(b.T0, b.T1, *workers)
+				nm, e2 := scanFull(bgb, b.T0, b.T1, b.HBase/8, *workers)
+				evals += e1 + e2
+				nm2, e3, rec := dipHunt(bgb, b.T0, b.T1, nm, *workers)
+				evals += e3
+				if rec > 0 && rec <= 24 {
+					nm = nm2
+				}
+				if diff := float64(len(nm)) - nDiff(b.T0, b.T1); diff > 8 {
+					alogf("REJECTED below-block rescan t=[%.3f,%.3f]: %d zeros vs expected %.1f (implausibly high); keeping previous count",
+						b.T0, b.T1, len(nm), nDiff(b.T0, b.T1))
+					continue
+				}
+				d := int64(len(nm)) - int64(b.Found)
+				if d <= 0 {
+					continue
+				}
+				b.Found = len(nm)
+				if b.Mult < 8 {
+					b.Mult = 8
+				}
+				st.ZerosFound += d
+				writeZeros(nm, fmt.Sprintf("rescan of [%.3f,%.3f]: supersedes earlier entries in this range", b.T0, b.T1))
+				logf("rescan below t=[%.3f,%.3f] recovered %d zeros", b.T0, b.T1, d)
+				checkAnchor()
+			}
+		}
+		if certDeficit != 0 && certDeficit != st.CertAck {
+			if certDeficit > 0 {
+				alogf("TURING DEFICIT block=%d: %d zero(s) PROVEN missing in (%.3f, %.3f) and not recoverable on the line. This is certified counting, not statistics. Investigate immediately with ./riemann check and independent tools.",
+					st.Blocks+1, certDeficit, st.AnchorT, anchorT)
+			} else if certDeficit < 0 {
+				alogf("TURING SURPLUS block=%d: %d more crossings than zeros exist in (%.3f, %.3f); phantom crossings indicate an evaluation bug",
+					st.Blocks+1, -certDeficit, st.AnchorT, anchorT)
 			}
 		}
 		st.CertAck = certDeficit

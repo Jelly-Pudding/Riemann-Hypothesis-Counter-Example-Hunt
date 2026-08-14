@@ -6,9 +6,15 @@ import (
 )
 
 // Turing's method with Trudgian's explicit constants (Improvements to
-// Turing's Method II, arXiv:1406.3416): for t2 > t1 > 1e5,
+// Turing's Method II, Rocky Mountain J. Math. 46 (2016), arXiv:1406.3416,
+// Theorem 1): for t2 > t1 > 1e5,
 //
 //	|integral_{t1}^{t2} S(t) dt| <= 1.698 + 0.183 loglog t2 + 0.049 log t2
+//
+// (Constants verified against the paper. They are tuned for t1 ~ 1e10 but
+// the paper states the whole table is valid for all t1 >= 1e5; at the
+// hunt's heights ~3e12 the bound evaluates to ~3.7, and uniqueness needs
+// only L > 2*(bound + slack) = ~7.7 < 12.)
 //
 // where N(t) = theta(t)/pi + 1 + S(t). Over a window [T, T+L] the
 // integral I(M) = M*L + sum_{z in window} (T+L-z) - integral(theta/pi+1)

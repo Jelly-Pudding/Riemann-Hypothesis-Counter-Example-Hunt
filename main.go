@@ -6,6 +6,7 @@ import (
 	"math/cmplx"
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
 )
 
@@ -81,9 +82,13 @@ func main() {
 			usage()
 		}
 		t0, t1 := math.Max(arg(2), 10), arg(3)
+		if t1 <= t0 {
+			fmt.Fprintln(os.Stderr, "check: t1 must be greater than t0")
+			os.Exit(2)
+		}
 		expected := nDiff(t0, t1)
 		var zs []float64
-		if t1 > 1e7 {
+		if t0 > 1e5 && t1 > 1e6 {
 			// High heights: interpolation engine, escalating density
 			// until the count settles.
 			spacing := 2 * math.Pi / math.Log(((t0+t1)/2)/(2*math.Pi))
@@ -110,9 +115,55 @@ func main() {
 			}
 		} else {
 			zs = FindZeros(t0, t1)
+			if float64(len(zs))-expected <= -1.5 {
+				// A close pair below the FindZeros step (Lehmer-style)
+				// reads as a deficit; escalate with dense direct scans
+				// before reporting one. Base density is 4 pts/spacing.
+				spacing := 2 * math.Pi / math.Log(((t0+t1)/2)/(2*math.Pi))
+				for _, mult := range []float64{16, 128} {
+					pts := int((t1 - t0) / spacing * 4 * mult)
+					zs2, _ := scanBlock(t0, t1, pts, runtime.NumCPU())
+					fmt.Printf("  density %4.0fx base (direct): %d sign changes (expected %.3f)\n",
+						mult, len(zs2), expected)
+					if len(zs2) > len(zs) {
+						zs = zs2
+					}
+					if float64(len(zs))-expected > -1.5 {
+						break
+					}
+				}
+			}
 		}
 		fmt.Printf("zeros found on the critical line in (%g, %g): %d\n", t0, t1, len(zs))
 		fmt.Printf("argument-principle count (up to |S(T)|<~2 wobble): %.3f\n", expected)
+		// Integer-exact verdict via Turing anchors at both ends of the
+		// range, when it supports them: t > 1e5 for the Trudgian bound
+		// and >= 3 window lengths so the anchor windows don't overlap.
+		// This removes the S(T) wobble ambiguity entirely -- the same
+		// certified counting the hunt's TURING DEFICIT alarm rests on.
+		if t0 > 1e5 && t1-t0 >= 3*turingL {
+			n0, r0, ok0 := turingAnchor(t0, zs)
+			n1, r1, ok1 := turingAnchor(t1-turingL, zs)
+			if ok0 && ok1 {
+				certified := n1 - n0
+				found := int64(sort.SearchFloat64s(zs, t1-turingL))
+				fmt.Printf("Turing-certified zeros in [%.3f, %.3f): %d; found on the line there: %d\n",
+					t0, t1-turingL, certified, found)
+				switch {
+				case found == certified:
+					fmt.Println("CERTIFIED: every zero in the certified interval is on the critical line")
+					return
+				case found < certified:
+					fmt.Printf("CERTIFIED DEFICIT: %d zero(s) proven missing from the line -- verify independently (mpmath, other hardware) before announcing\n",
+						certified-found)
+					return
+				default:
+					fmt.Println("SURPLUS: more crossings than certified zeros exist -- an evaluation bug, not a discovery")
+					return
+				}
+			}
+			fmt.Printf("Turing anchors did not lock (residuals %+.2f / %+.2f; a zero may be missing near a range edge); statistical verdict follows\n", r0, r1)
+		}
 		diff := expected - float64(len(zs))
 		switch {
 		case math.Abs(diff) < 2:
