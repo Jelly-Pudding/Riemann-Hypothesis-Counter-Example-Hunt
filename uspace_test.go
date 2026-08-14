@@ -93,21 +93,31 @@ func TestFastKernelMatchesFull(t *testing.T) {
 }
 
 // The fast base pass re-checks hairline crossings with the full kernel
-// before counting them. On a clean stretch the veto must never fire and
-// the fast scan's crossing count must match the full-kernel scan's.
+// before counting them. The stretch must be long enough (~214k zeros in
+// full mode) to contain several hairline cases -- zeros within
+// kernel-error distance of a lattice point, where the two kernels
+// disagree about which cell the crossing falls in. (A first version of
+// the veto re-checked only the flagged cell and dropped ~150 REAL zeros
+// per production block; a short stretch cannot expose that.) The veto
+// must classify every hairline crossing as real (fast count == full
+// count) and fire only on true phantoms, of which zeta supplies none.
 func TestFastScanPhantomVeto(t *testing.T) {
 	a := 3e12
-	b := a + 30
+	span := 50000.0
+	if testing.Short() {
+		span = 30 // mechanism smoke only; no hairline coverage
+	}
+	b := a + span
 	bg, _ := buildBlockGrid(a, b, 8)
 	phantomDrops.Store(0)
 	h := math.Ldexp(1, -8)
 	m1, _, _ := bg.scan(a, b, h, 8, true, true)
+	if n := phantomDrops.Swap(0); n != 0 {
+		t.Errorf("full-kernel veto dropped %d crossings of real zeros", n)
+	}
 	m2, _, _ := bg.scan(a, b, h, 8, true, false)
 	if len(m1) != len(m2) {
-		t.Fatalf("fast scan found %d crossings, full scan %d", len(m1), len(m2))
-	}
-	if n := phantomDrops.Swap(0); n != 0 {
-		t.Fatalf("full-kernel veto dropped %d crossings on a clean stretch", n)
+		t.Errorf("fast scan found %d crossings, full scan %d", len(m1), len(m2))
 	}
 }
 

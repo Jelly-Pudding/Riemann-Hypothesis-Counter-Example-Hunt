@@ -274,14 +274,29 @@ func (bg *blockGrid) scan(a, b, h float64, workers int, dips, fast bool) ([]floa
 			if (prev < 0) != (cur < 0) && (includeSeed || gj > 1) {
 				keep := true
 				if fast && math.Min(math.Abs(prev), math.Abs(cur)) < tangentVerify {
-					// Hairline crossing: re-evaluate both flanking lattice
-					// points with the full kernel (index-exact, so this
-					// works at any h including sub-ulp). If the sign change
-					// vanishes it was kernel error, not a zero pair; veto
-					// it before it enters the ledger.
-					var vf [2]float64
-					bg.evalRange(a0, h, gj-2, gj, 1, vf[:], false)
-					if (vf[0] < 0) == (vf[1] < 0) {
+					// Hairline crossing: the zero sits within kernel-error
+					// distance of a lattice point, so the fast and full
+					// kernels can legitimately disagree about WHICH cell it
+					// falls in (~150 per block do). Never re-check just the
+					// flagged cell -- re-evaluate a +-4 cell window with the
+					// full kernel (index-exact at any h). A real zero shows
+					// a crossing somewhere in the window and is kept (a cell
+					// of position slack is well inside the midpoint budget);
+					// an isolated tiny-|Z'| zero cannot shift further than
+					// that because tiny |Z'| implies a near-double zero,
+					// whose partner is inside the window too. A phantom -- a
+					// same-sign dip pushed across zero by the fast kernel's
+					// ~1.2e-5 error -- shows no crossing at all: vetoed.
+					var vf [10]float64
+					bg.evalRange(a0, h, gj-6, gj+4, 1, vf[:], false)
+					crossed := false
+					for k := 1; k < len(vf); k++ {
+						if (vf[k-1] < 0) != (vf[k] < 0) {
+							crossed = true
+							break
+						}
+					}
+					if !crossed {
 						phantomDrops.Add(1)
 						keep = false
 					}
