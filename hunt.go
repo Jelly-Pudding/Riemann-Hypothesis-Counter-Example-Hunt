@@ -7,11 +7,40 @@ import (
 	"math"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// buildRev is the git revision baked into the binary by go build, so a
+// hunt log records which code produced each session's lines. "+dirty"
+// marks uncommitted changes.
+func buildRev() string {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	rev, dirty := "", ""
+	for _, s := range bi.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			if s.Value == "true" {
+				dirty = "+dirty"
+			}
+		}
+	}
+	if rev == "" {
+		return "unknown"
+	}
+	if len(rev) > 12 {
+		rev = rev[:12]
+	}
+	return rev + dirty
+}
 
 // devTrip is the alarm threshold on dev (cum drift vs rolling median
 // baseline). S(T) excursions of 2 to 3 lasting tens of blocks are
@@ -46,10 +75,26 @@ type huntState struct {
 func saveState(path string, s *huntState) {
 	b, _ := json.MarshalIndent(s, "", "  ")
 	tmp := path + ".tmp"
-	err := os.WriteFile(tmp, b, 0644)
-	if err == nil {
-		err = os.Rename(tmp, path)
-	}
+	// Write-fsync-rename so a crash mid-write can never leave a truncated
+	// state file in place of a good one.
+	err := func() error {
+		f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+		if err != nil {
+			return err
+		}
+		if _, err := f.Write(b); err != nil {
+			f.Close()
+			return err
+		}
+		if err := f.Sync(); err != nil {
+			f.Close()
+			return err
+		}
+		if err := f.Close(); err != nil {
+			return err
+		}
+		return os.Rename(tmp, path)
+	}()
 	if err != nil {
 		// Disk trouble must be loud: without state the hunt cannot resume.
 		fmt.Fprintf(os.Stderr, "WARNING: cannot save state to %s: %v\n", path, err)
@@ -405,16 +450,27 @@ func runHunt(args []string) {
 	st := &huntState{StartT: start, NextT: start}
 	if b, err := os.ReadFile(*statePath); err == nil {
 		var prev huntState
-		if json.Unmarshal(b, &prev) == nil {
-			if prev.StartT != start {
-				fmt.Fprintf(os.Stderr,
-					"state file %s belongs to a hunt starting at %g (you asked for %g);\n"+
-						"delete it or pass a different -state file\n",
-					*statePath, prev.StartT, start)
-				os.Exit(2)
-			}
-			st = &prev
+		if err := json.Unmarshal(b, &prev); err != nil {
+			// A corrupt state file must be loud: silently starting over
+			// would quietly discard the entire hunt's progress.
+			fmt.Fprintf(os.Stderr,
+				"state file %s exists but cannot be parsed: %v\n"+
+					"refusing to silently restart from %g; restore the file (the git repo has\n"+
+					"recent copies) or delete it to deliberately start over\n",
+				*statePath, err, start)
+			os.Exit(2)
 		}
+		if prev.StartT != start {
+			fmt.Fprintf(os.Stderr,
+				"state file %s belongs to a hunt starting at %g (you asked for %g);\n"+
+					"delete it or pass a different -state file\n",
+				*statePath, prev.StartT, start)
+			os.Exit(2)
+		}
+		st = &prev
+	} else if !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "cannot read state file %s: %v\n", *statePath, err)
+		os.Exit(2)
 	}
 
 	openLog := func(path string) *os.File {
@@ -459,9 +515,9 @@ func runHunt(args []string) {
 	}
 
 	if st.NextT > st.StartT {
-		logf("resume start=%g at=%.6f zeros_so_far=%d blocks=%d", st.StartT, st.NextT, st.ZerosFound, st.Blocks)
+		logf("resume start=%g at=%.6f zeros_so_far=%d blocks=%d rev=%s", st.StartT, st.NextT, st.ZerosFound, st.Blocks, buildRev())
 	} else {
-		logf("hunt start=%g block=%g workers=%d stepdiv=%g", start, *block, *workers, *stepdiv)
+		logf("hunt start=%g block=%g workers=%d stepdiv=%g rev=%s", start, *block, *workers, *stepdiv, buildRev())
 	}
 
 	// Pre-build the ln/rsqrt tables so the first block's timing is honest.
@@ -504,20 +560,24 @@ func runHunt(args []string) {
 
 		rescans, mult := 0, 1
 		eventful := false // heavy passes or rejections force this block's log line
+		if n := phantomDrops.Swap(0); n > 0 {
+			eventful = true
+			logf("dropped %d phantom crossing(s) in base scan (full-kernel veto) block=%d", n, st.Blocks+1)
+		}
 		probeRec := 0
 		if len(cands) > 0 {
 			prev := mids
 			var e2 int64
 			mids, e2, probeRec = probeCandidates(bg, cands, hBase, t0, t1, mids, *workers)
 			evals += e2
+			// Probe recoveries are reported via probes=c/r; rescans counts
+			// only full-block heavy passes so routine blocks read rescans=0.
 			if d := len(mids) - len(prev); d < -2 || d > 64 {
 				alogf("REJECTED dip probes block=%d: count moved by %+d (implausible); keeping previous list",
 					st.Blocks+1, d)
 				mids = prev
 				probeRec = 0
 				eventful = true
-			} else if probeRec > 0 {
-				rescans++
 			}
 		}
 

@@ -92,6 +92,25 @@ func TestFastKernelMatchesFull(t *testing.T) {
 	}
 }
 
+// The fast base pass re-checks hairline crossings with the full kernel
+// before counting them. On a clean stretch the veto must never fire and
+// the fast scan's crossing count must match the full-kernel scan's.
+func TestFastScanPhantomVeto(t *testing.T) {
+	a := 3e12
+	b := a + 30
+	bg, _ := buildBlockGrid(a, b, 8)
+	phantomDrops.Store(0)
+	h := math.Ldexp(1, -8)
+	m1, _, _ := bg.scan(a, b, h, 8, true, true)
+	m2, _, _ := bg.scan(a, b, h, 8, true, false)
+	if len(m1) != len(m2) {
+		t.Fatalf("fast scan found %d crossings, full scan %d", len(m1), len(m2))
+	}
+	if n := phantomDrops.Swap(0); n != 0 {
+		t.Fatalf("full-kernel veto dropped %d crossings on a clean stretch", n)
+	}
+}
+
 // At t = 2.9e13 one ulp is 2^-7 and the base lattice (2^-9 here) sits
 // below it: the old engine could not scan at all at this height. The
 // count over a 50-unit window must match the argument principle within

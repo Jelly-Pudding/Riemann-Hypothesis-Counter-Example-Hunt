@@ -3,7 +3,23 @@ package main
 import (
 	"fmt"
 	"math"
+	"sync/atomic"
 )
+
+// phantomDrops counts crossings vetoed by the full-kernel re-check in
+// fast scans. Read-and-reset by the hunt loop for per-block logging.
+var phantomDrops atomic.Int64
+
+// tangentVerify: fast-pass crossings whose smaller flanking |Z| is below
+// this are re-evaluated with the full kernel (error ~6e-9) before being
+// counted. The fast kernel's ~1.2e-5 error could otherwise fabricate a
+// crossing pair out of a near-tangent minimum -- the one failure mode
+// that silently BALANCES the Turing ledger if a real pair goes missing
+// in the same certified stretch (a phantom alone is caught as a
+// surplus; phantom + miss together cancel). 1e-4 sits ~8x above the
+// fast kernel's error floor yet flags well under 1% of crossings, so
+// the veto costs a handful of full-kernel evaluations per block.
+const tangentVerify = 1e-4
 
 // Band-limited interpolation of the Riemann-Siegel main sum.
 //
@@ -256,13 +272,29 @@ func (bg *blockGrid) scan(a, b, h float64, workers int, dips, fast bool) ([]floa
 			cur := zs[j]
 			gj := cs + j
 			if (prev < 0) != (cur < 0) && (includeSeed || gj > 1) {
-				m := a0 + (float64(gj)-1.5)*h
-				if m < a {
-					// Seed-interval crossings belong to (a, a0]; clamp the
-					// estimate so callers' [a, b] bookkeeping stays exact.
-					m = a
+				keep := true
+				if fast && math.Min(math.Abs(prev), math.Abs(cur)) < tangentVerify {
+					// Hairline crossing: re-evaluate both flanking lattice
+					// points with the full kernel (index-exact, so this
+					// works at any h including sub-ulp). If the sign change
+					// vanishes it was kernel error, not a zero pair; veto
+					// it before it enters the ledger.
+					var vf [2]float64
+					bg.evalRange(a0, h, gj-2, gj, 1, vf[:], false)
+					if (vf[0] < 0) == (vf[1] < 0) {
+						phantomDrops.Add(1)
+						keep = false
+					}
 				}
-				mids = append(mids, m)
+				if keep {
+					m := a0 + (float64(gj)-1.5)*h
+					if m < a {
+						// Seed-interval crossings belong to (a, a0]; clamp the
+						// estimate so callers' [a, b] bookkeeping stays exact.
+						m = a
+					}
+					mids = append(mids, m)
+				}
 			}
 			if dips && gj >= 2 && math.Abs(prev) < dipThresh &&
 				math.Abs(prev) <= math.Abs(p2) && math.Abs(prev) <= math.Abs(cur) &&

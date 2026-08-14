@@ -80,6 +80,8 @@ Then as root: `systemctl restart zeta`
 - Each block is 1 million height units which is about 4.28 million zeros.
 - drift stays between −1.5 and +1.5 and dev stays between −2.5 and +2.5. That is ordinary statistical wobble.
 - probes=c/r on the block line counts dip probes. A few zero pairs per block sit closer together than the scan grid. Each one leaves a fingerprint where Z dips near zero without crossing. The base scan spots these as it goes and tiny probes confirm the pair and add it to the count. c candidates checked and r zeros recovered is normal on most blocks.
+- rescans on the block line counts full-block heavy passes only (8x, diphunt, below-block); routine blocks read rescans=0 even when probes recovered pairs.
+- A "dropped N phantom crossing(s)" line means the base pass saw a hairline sign change that the accurate kernel vetoed as evaluation error. Very rare; this keeps false crossings out of the ledger, where a phantom pair could otherwise mask a genuinely missing pair in the same certified stretch.
 - Every block ends with a silent Turing certification. It proves the exact total number of zeros below the block end using Turing's method. The count of zeros found must match that proven total exactly.
 - rescan, diphunt and backscan lines are rare fallbacks. A rescan with certified_deficit means the proven total showed a zero was missed and heavier passes went and found it. Fine in moderation.
 - A "rescan below" line means a certified deficit pointed into an earlier block (typically a pair hiding in the previous block's anchor window); that block gets the full heavy ladder before any alarm can fire. Also fine in moderation.
