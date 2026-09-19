@@ -34,7 +34,27 @@ Smoke test. It should end with "CERTIFIED: every zero in the certified interval 
 
 ## Running it 24/7
 
-One systemd unit as root:
+The hunt shares the box with the Minecraft server so it is fenced off at the kernel level rather than just niced. Two rules do the work:
+
+- **AllowedCPUs** confines every hunt thread (including Go's GC) to physical cores 2-5. Cores 0 and 1 with both hyperthreads are never touched, so Minecraft's tick thread always has idle cores to land on. This is a hard mask, not a priority.
+- **hunt.slice with CPUWeight=1** puts the hunt in its own top-level cgroup at the minimum weight. Minecraft runs in a screen under user.slice (weight 100), and nice values do not cross cgroups, so this is what makes Minecraft win 100:1 on the cores they do share.
+
+Check the hyperthread pairs first. On the i7-8700 this prints `0,6 1,7 2,8 3,9 4,10 5,11`; if it prints `0,1 2,3 ...` instead use `AllowedCPUs=4-11`:
+
+```sh
+cat /sys/devices/system/cpu/cpu[0-5]/topology/thread_siblings_list
+```
+
+Two files as root:
+
+```ini
+# /etc/systemd/system/hunt.slice
+[Unit]
+Description=Riemann hunt, lowest CPU priority
+
+[Slice]
+CPUWeight=1
+```
 
 ```ini
 # /etc/systemd/system/zeta.service
@@ -45,7 +65,10 @@ After=network.target
 [Service]
 User=alphaalex115
 WorkingDirectory=/home/alphaalex115/Riemann-Hypothesis-Counter-Example-Hunt
-ExecStart=/home/alphaalex115/Riemann-Hypothesis-Counter-Example-Hunt/riemann hunt 3000000000000 -workers 10
+ExecStart=/home/alphaalex115/Riemann-Hypothesis-Counter-Example-Hunt/riemann hunt 3000000000000 -workers 8
+Slice=hunt.slice
+AllowedCPUs=2-5,8-11
+CPUWeight=1
 Nice=19
 IOSchedulingClass=idle
 MemoryMax=12G
@@ -56,11 +79,23 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
+`-workers 8` matches the eight logical CPUs the mask allows. Ten workers on all twelve threads is about 15% faster but shares cores with Minecraft.
+
 ```sh
 systemctl daemon-reload
 systemctl enable --now zeta
 tail -f /home/alphaalex115/Riemann-Hypothesis-Counter-Example-Hunt/hunt.log
 ```
+
+Verify the fence landed:
+
+```sh
+cat /proc/$(pgrep -f 'riemann hunt' | head -1)/cgroup            # /hunt.slice/zeta.service
+cat /sys/fs/cgroup/hunt.slice/cpu.weight                         # 1
+cat /sys/fs/cgroup/hunt.slice/zeta.service/cpuset.cpus.effective # 2-5,8-11
+```
+
+htop should show CPUs 0, 1, 6 and 7 idle whenever the server is quiet.
 
 ## Updating the hunt
 
