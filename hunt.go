@@ -589,26 +589,41 @@ func runHunt(args []string) {
 		// statistical hint, and forces the heavy recovery passes.
 		anchorT := t1 - turingL
 		certDeficit := int64(0)
-		checkAnchor := func() {
+		var anchorN, anchorFound int64 // from the last successful certification
+		anchorOK := false
+		// checkAnchor(false) only measures the discrepancy, to decide which
+		// recovery passes to run. checkAnchor(true) certifies the FINAL list
+		// and advances the anchor. The anchor must never be committed from
+		// a list that a later pass then changes: that leaves AnchorFound
+		// one behind the ledger and the next block reports a false surplus.
+		checkAnchor := func(commit bool) {
 			certDeficit = 0
+			anchorOK = false
 			aN, res, ok := turingAnchor(anchorT, mids)
 			if !ok {
-				logf("turing anchor at %.3f failed (residual %+.2f); retrying next block", anchorT, res)
+				if commit {
+					logf("turing anchor at %.3f failed (residual %+.2f); retrying next block", anchorT, res)
+				}
 				return
 			}
+			anchorOK = true
 			foundAt := st.ZerosFound + int64(sort.SearchFloat64s(mids, anchorT))
+			anchorN, anchorFound = aN, foundAt
 			if st.AnchorN != 0 {
 				certDeficit = (aN - st.AnchorN) - (foundAt - st.AnchorFound)
 			}
-			if certDeficit == 0 {
+			if commit && certDeficit == 0 {
 				st.AnchorT, st.AnchorN, st.AnchorFound = anchorT, aN, foundAt
 			}
 		}
-		checkAnchor()
+		checkAnchor(false)
 
 		// Fallback sweep: when probing left the count short of a pair OR
-		// the Turing ledger proves zeros are missing.
-		if drift := float64(len(mids)) - expected; drift <= -1.5 || certDeficit > 0 {
+		// the Turing ledger disagrees with the count in either direction.
+		// A surplus (phantom crossing) gets the same finer pass: the 8x
+		// list replaces the base list, so a crossing the finer kernel does
+		// not reproduce is dropped here rather than carried in the ledger.
+		if drift := float64(len(mids)) - expected; drift <= -1.5 || certDeficit != 0 {
 			rescans++
 			eventful = true
 			logf("rescan block=%d pass=8x full drift=%+.3f certified_deficit=%d", st.Blocks+1, drift, certDeficit)
@@ -645,9 +660,10 @@ func runHunt(args []string) {
 				logf("rescan block=%d diphunt recovered %d zeros", st.Blocks+1, rec)
 			}
 		}
+		// Certify the final list and advance the anchor from it.
+		checkAnchor(true)
 		if certDeficit != 0 {
 			eventful = true
-			checkAnchor() // re-certify after in-block recovery passes
 		}
 		// The certified interval (st.AnchorT, anchorT) can begin in an
 		// EARLIER block: a pair straddled inside a previous block's anchor
@@ -687,17 +703,25 @@ func runHunt(args []string) {
 				st.ZerosFound += d
 				writeZeros(nm, fmt.Sprintf("rescan of [%.3f,%.3f]: supersedes earlier entries in this range", b.T0, b.T1))
 				logf("rescan below t=[%.3f,%.3f] recovered %d zeros", b.T0, b.T1, d)
-				checkAnchor()
+				checkAnchor(true)
 			}
 		}
-		if certDeficit != 0 && certDeficit != st.CertAck {
-			if certDeficit > 0 {
-				alogf("TURING DEFICIT block=%d: %d zero(s) PROVEN missing in (%.3f, %.3f) and not recoverable on the line. This is certified counting, not statistics. Investigate immediately with ./riemann check and independent tools.",
-					st.Blocks+1, certDeficit, st.AnchorT, anchorT)
-			} else if certDeficit < 0 {
-				alogf("TURING SURPLUS block=%d: %d more crossings than zeros exist in (%.3f, %.3f); phantom crossings indicate an evaluation bug",
-					st.Blocks+1, -certDeficit, st.AnchorT, anchorT)
-			}
+		if certDeficit > 0 && certDeficit != st.CertAck {
+			alogf("TURING DEFICIT block=%d: %d zero(s) PROVEN missing in (%.3f, %.3f) and not recoverable on the line. This is certified counting, not statistics. Investigate immediately with ./riemann check and independent tools.",
+				st.Blocks+1, certDeficit, st.AnchorT, anchorT)
+		}
+		if certDeficit < 0 && anchorOK {
+			// A surplus that survived the 8x pass. Alarm, then re-base the
+			// ledger on the certified count: drop the phantom(s) from the
+			// running total and advance the anchor. Carrying a surplus
+			// forward is what must not happen: the next block that is
+			// short by one would read as certified-clean, its rescan would
+			// never fire, and a real missing zero would be masked.
+			alogf("TURING SURPLUS block=%d: %d more crossings than zeros exist in (%.3f, %.3f); phantom crossings indicate an evaluation bug. Ledger re-based to the certified count; check this block with ./riemann check",
+				st.Blocks+1, -certDeficit, st.AnchorT, anchorT)
+			st.ZerosFound += certDeficit
+			st.AnchorT, st.AnchorN, st.AnchorFound = anchorT, anchorN, anchorFound+certDeficit
+			certDeficit = 0
 		}
 		st.CertAck = certDeficit
 		dur := time.Since(blockStart)
